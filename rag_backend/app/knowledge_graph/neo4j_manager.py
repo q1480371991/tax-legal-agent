@@ -634,15 +634,23 @@ class Neo4jManager:
         tenant_id = str(tenant_id) if tenant_id else None
         try:
             with self.driver.session(database=settings.NEO4J_DATABASE) as session:
+                # 同时取「节点」与「路径上的边」——
+                # 边（关系）既用于沿图遍历，也用于拼进 prompt 补充关系知识
+                # （如「比亚迪 --SUBSIDIARY_OF--> 某某公司」）。
                 query = Query("""
                     MATCH path = (e:Entity)-[*0..%d]-(related:Entity)
                     WHERE (e.name IN $names)
                       AND (e.tenant_id IS NULL OR e.tenant_id = $tenant_id)
-                    WITH related, length(path) AS dist
+                    WITH related, length(path) AS dist, relationships(path) AS rels
                     RETURN DISTINCT related.name AS name,
                            related.type AS type,
                            related.chunk_ids AS chunk_ids,
-                           dist
+                           dist,
+                           [r IN rels | {
+                               source: startNode(r).name,
+                               target: endNode(r).name,
+                               type: type(r)
+                           }] AS path_rels
                     ORDER BY dist
                     LIMIT $limit
                 """ % max_depth)
@@ -652,12 +660,22 @@ class Neo4jManager:
                 chunk_ids: List[str] = []
                 chunk_distances: Dict[str, int] = {}
                 entities: List[Dict] = []
+                relations: List[Dict] = []
+                seen_rel = set()
                 for record in result:
                     entities.append({
                         "name": record["name"],
                         "type": record["type"],
                         "distance": record["dist"],
                     })
+                    # 收集路径上的关系（去重）
+                    for r in (record.get("path_rels") or []):
+                        if not isinstance(r, dict) or not r.get("source"):
+                            continue
+                        key = f"{r['source']}|{r.get('type')}|{r['target']}"
+                        if key not in seen_rel:
+                            seen_rel.add(key)
+                            relations.append(r)
                     dist = record["dist"]
                     for cid in (record["chunk_ids"] or []):
                         if cid not in chunk_distances:
@@ -669,7 +687,7 @@ class Neo4jManager:
                     "chunk_ids": chunk_ids,
                     "chunk_distances": chunk_distances,
                     "entities": entities,
-                    "relations": [],
+                    "relations": relations,
                 }
         except Exception as e:
             logger.warning(f"[Neo4j] 按实体查 chunk 失败: {e}")

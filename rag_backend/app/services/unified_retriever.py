@@ -278,7 +278,8 @@ class UnifiedRetriever:
                     f"(跳数分布: {sorted(set(distances.get(c,1) for c in new_ids))})"
                 )
 
-            # ④ 构造图谱上下文（实体列表，供 prompt 使用）
+            # ④ 构造图谱上下文（实体 + 关系，供 prompt 使用）
+            relations = graph_hits.get("relations", []) or []
             if entities:
                 by_type: Dict[str, List[str]] = {}
                 for e in entities[:20]:
@@ -289,8 +290,15 @@ class UnifiedRetriever:
                          f"（由检索内容中的实体扩展，种子: {', '.join(seed_entities[:5])}）"]
                 for t, names in by_type.items():
                     parts.append(f"  [{t}] {', '.join(names[:8])}")
+                # 关系段：把「A --关系--> B」也拼进去 ——
+                # 这是图谱相对向量检索的独特价值（向量算不出实体间的语义关系），
+                # 此前只拼实体名、丢弃了关系（relations 恒为空）。
+                if relations:
+                    parts.append("  关系：")
+                    for r in relations[:15]:
+                        parts.append(f"    {r.get('source','')} --{r.get('type','')}--> {r.get('target','')}")
                 graph_results = {
-                    "entities": entities, "relations": [],
+                    "entities": entities, "relations": relations,
                     "context": "\n".join(parts) + "\n",
                     "found": True, "seed_entities": seed_entities,
                     "graph_chunk_ids": hit_ids,
