@@ -365,27 +365,11 @@ class HybridSearchService:
                     "tenant_id": str(tenant_id)
                 }
 
-                # 检查是否已迁移到新架构（fts_vector 列存在）
-                check_fts_column = await db.execute(text("""
-                    SELECT EXISTS (
-                        SELECT 1 FROM information_schema.columns 
-                        WHERE table_name = 'document_chunks' 
-                        AND column_name = 'fts_vector'
-                    ) as exists
-                """))
-                has_fts_column = check_fts_column.scalar()
-
-                if has_fts_column:
-                    # 使用优化的全文检索
-                    return await self._fts_search_optimized(
-                        query, kb_id, top_k, tenant_id, user_id
-                    )
-                else:
-                    # 回退到传统方式（仅警告，不使用 ILIKE）
-                    logger.warning("⚠️ 未检测到 fts_vector 列，使用基本全文检索")
-                    return await self._fts_search_basic(
-                        query, kb_id, top_k, tenant_id, user_id
-                    )
+                # 使用 content_tsvector（由应用层 jieba 分词后写入，中文可检索）。
+                # 注意：fts_vector 是遗留空列，不可用。
+                return await self._fts_search_optimized(
+                    query, kb_id, top_k, tenant_id, user_id
+                )
 
         except Exception as e:
             logger.error(f"❌ 全文搜索失败: {e}", exc_info=True)
@@ -407,9 +391,12 @@ class HybridSearchService:
         results = []
 
         try:
-            # 使用 pg_catalog.simple 配置，支持中英文混合
-            # to_tsquery 在 SQL 中调用，这里准备查询字符串
-            search_query = query
+            # 中文分词：simple 配置不切中文，须应用层用 jieba 切成词后再构造 tsquery
+            from app.utils.chinese_fts import build_tsquery
+            search_query = build_tsquery(query)
+            if not search_query:
+                logger.debug(f"[FTS] 查询无有效检索词，跳过: {query[:30]}")
+                return []
 
             async with AsyncSessionLocal() as db:
                 where_clauses = []
@@ -450,18 +437,18 @@ class HybridSearchService:
                         c.meta_info,
                         d.filename,
                         kb.name as kb_name,
-                        ts_rank_cd(c.fts_vector, to_tsquery('pg_catalog.simple', :query)) AS rank,
+                        ts_rank_cd(c.content_tsvector, to_tsquery('simple', :query)) AS rank,
                         ts_headline(
-                            'pg_catalog.simple',
+                            'simple',
                             c.content,
-                            to_tsquery('pg_catalog.simple', :query),
+                            to_tsquery('simple', :query),
                             'MaxWords=50, MinWords=20, StartSel=<mark>, StopSel=</mark>'
                         ) AS highlight
                     FROM document_chunks c
                     JOIN documents d ON c.document_id = d.id
                     JOIN knowledge_bases kb ON d.kb_id = kb.id
                     WHERE {where_sql}
-                    AND c.fts_vector @@ to_tsquery('pg_catalog.simple', :query)
+                    AND c.content_tsvector @@ to_tsquery('simple', :query)
                     ORDER BY rank DESC
                     LIMIT :limit
                 """)

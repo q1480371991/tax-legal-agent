@@ -622,17 +622,26 @@ class SearchService:
         if not query or not query.strip():
             return []
 
+        # 中文分词：PostgreSQL 的 simple 配置不切中文（整串当一个 token），
+        # 必须在应用层用 jieba 切成词，再用 to_tsquery 匹配分词后的 tsvector，
+        # 否则中文 BM25 检索恒为 0 命中。
+        from app.utils.chinese_fts import build_tsquery
+        tsq = build_tsquery(query)
+        if not tsq:
+            logger.debug(f"[BM25] 查询无有效检索词，跳过: {query[:30]}")
+            return []
+
         async with AsyncSessionLocal() as db:
             select_clause = [
                 "c.id", "c.content", "c.domain", "c.node_type",
                 "c.meta_info", "c.relationships", "c.summary",
-                "ts_rank(c.content_tsvector, plainto_tsquery('simple', :q)) AS bm25_score"
+                "ts_rank(c.content_tsvector, to_tsquery('simple', :q)) AS bm25_score"
             ]
             where_clauses = [
-                "c.content_tsvector @@ plainto_tsquery('simple', :q)",
+                "c.content_tsvector @@ to_tsquery('simple', :q)",
                 "d.tenant_id = :tenant_id",
             ]
-            params = {"q": query, "tenant_id": str(tenant_id), "limit": int(top_k)}
+            params = {"q": tsq, "tenant_id": str(tenant_id), "limit": int(top_k)}
 
             if domain:
                 where_clauses.append("c.domain = :domain")
