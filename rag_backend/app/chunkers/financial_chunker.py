@@ -100,6 +100,11 @@ class FinancialChunker:
         # 财务指标实体提取 + 关系构建
         chunks = self._extract_financial_metrics(chunks)
 
+        # 分配位置序号，与存储层 enumerate 写库的 chunk_index 列对齐。
+        # relationship_builder 会据此把相邻的「正文 PARENT + 表格 CHILD」配对。
+        for i, chunk in enumerate(chunks):
+            chunk.chunk_index = i
+
         logger.info(
             f"[FinancialChunker] 切块完成: {len(chunks)} 个 chunk"
         )

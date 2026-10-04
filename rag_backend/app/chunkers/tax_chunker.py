@@ -70,6 +70,16 @@ class TaxChunker:
             chunk.domain = "tax"
             chunk.metadata.update(lifecycle_meta)
 
+        # 分配位置序号 + 建立相邻条款 PREVIOUS/NEXT 指针。
+        # 在此处（而非 relationship_builder）建链，因为 chunk_index 已被赋为唯一位置，
+        # 不会像原先那样所有节点编号都是 0、互相覆盖导致链条断裂。
+        for i, chunk in enumerate(chunks):
+            chunk.chunk_index = i
+            if i > 0:
+                chunk.relationships["PREVIOUS"] = i - 1
+            if i < len(chunks) - 1:
+                chunk.relationships["NEXT"] = i + 1
+
         logger.info(
             f"[TaxChunker] 切块完成: {len(chunks)} 个条款"
         )

@@ -95,24 +95,12 @@ class RelationshipBuilder:
         """
         税务关系构建。
 
-        按 clause 序号建立 PREVIOUS / NEXT 指针。
-        所有节点按 chunk_index 排序后依次链接。
+        PREVIOUS/NEXT 指针已在 TaxChunker 内建立（那时 chunk_index 已赋为唯一位置值）。
+        这里不再重复处理：早期实现在此按 chunk_index 建链，但当时所有 chunk 的
+        chunk_index 均为默认值 0，导致每个节点都指向 0、互相覆盖，链条完全断裂。
         """
-        sorted_chunks = sorted(chunks, key=lambda c: c.chunk_index)
-
-        for i, chunk in enumerate(sorted_chunks):
-            if i > 0:
-                chunk.relationships[self.PREVIOUS_RELATION] = (
-                    sorted_chunks[i - 1].chunk_index
-                )
-            if i < len(sorted_chunks) - 1:
-                chunk.relationships[self.NEXT_RELATION] = (
-                    sorted_chunks[i + 1].chunk_index
-                )
-
         logger.debug(
-            f"[RelationshipBuilder] Tax: 为 {len(chunks)} 个 clause "
-            f"建立 PREVIOUS/NEXT 链"
+            f"[RelationshipBuilder] Tax: PREVIOUS/NEXT 已由 TaxChunker 建立，跳过"
         )
         return chunks
 

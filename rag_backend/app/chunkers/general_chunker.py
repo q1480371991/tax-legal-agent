@@ -60,28 +60,32 @@ class GeneralChunker:
             chunk.node_type = "parent"
 
         # Step 2: 对每个父块做细分（256 token 目标）
+        # 先收集分组，待 LEAF 总数确定后再统一分配 chunk_index。
+        # 返回顺序固定为 [所有 LEAF, 所有 PARENT]，chunk_index 与该顺序一致，
+        # 从而与存储层 enumerate 写库的 chunk_index 列对齐（关系引用依赖此约定）。
+        grouped: List[tuple] = []
         leaf_chunks: List[ChunkResult] = []
         for parent in parent_chunks:
             leaves = self._split_into_leaves(parent)
             for leaf in leaves:
                 leaf.domain = "general"
                 leaf.node_type = "leaf"
-                leaf.relationships = {"PARENT": parent.chunk_index}
+            grouped.append((parent, leaves))
             leaf_chunks.extend(leaves)
 
-        # Step 3: 建立 PARENT → CHILDREN 反向引用
-        parent_to_children: dict = {}
-        for leaf in leaf_chunks:
-            parent_idx = leaf.relationships["PARENT"]
-            parent_to_children.setdefault(parent_idx, []).append(leaf)
+        for i, leaf in enumerate(leaf_chunks):
+            leaf.chunk_index = i
+        parent_offset = len(leaf_chunks)
+        for j, parent in enumerate(parent_chunks):
+            parent.chunk_index = parent_offset + j
 
-        for parent in parent_chunks:
-            if parent.chunk_index in parent_to_children:
-                child_indices = [
-                    c.chunk_index
-                    for c in parent_to_children[parent.chunk_index]
-                ]
-                parent.relationships = {"CHILDREN": child_indices}
+        # Step 3: 建立 LEAF → PARENT 与 PARENT → CHILDREN 关系
+        for parent, leaves in grouped:
+            parent.relationships = {
+                "CHILDREN": [leaf.chunk_index for leaf in leaves]
+            }
+            for leaf in leaves:
+                leaf.relationships = {"PARENT": parent.chunk_index}
 
         all_chunks = leaf_chunks + parent_chunks
 

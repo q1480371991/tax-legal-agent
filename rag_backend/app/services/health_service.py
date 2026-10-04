@@ -160,10 +160,12 @@ class HealthService:
         
         try:
             from app.services.redis_service import get_redis_service
-            
-            redis_service = await get_redis_service()
-            result = await redis_service.redis.set("health_check", "ok", ex=10)
-            
+
+            # get_redis_service() 是同步函数，直接返回实例；客户端属性名为 .client。
+            # 用 ping() 而非 set()：不写入数据，且是 Redis 连接的标准探活方式。
+            redis_service = get_redis_service()
+            result = bool(redis_service.client.ping()) if redis_service.client else False
+
             if result:
                 latency = (time.time() - start_time) * 1000
                 
@@ -291,27 +293,34 @@ class HealthService:
         
         try:
             from app.services.minio_service import minio_service
-            
-            # 检查MinIO连接
-            await asyncio.wait_for(
-                minio_service.health_check(),
+
+            # minio_service.health_check() 是同步方法（返回 dict），不是协程，
+            # 因此用 asyncio.to_thread 放到线程池执行以避免阻塞事件循环，
+            # 而不是直接 await（会报 "an awaitable is required"）。
+            result = await asyncio.wait_for(
+                asyncio.to_thread(minio_service.health_check),
                 timeout=self.CHECK_TIMEOUT
             )
-            
+
             latency = (time.time() - start_time) * 1000
-            
+            healthy = isinstance(result, dict) and result.get("status") == "healthy"
+
             return ComponentHealth(
                 name="storage",
-                status=HealthStatus.HEALTHY,
+                status=HealthStatus.HEALTHY if healthy else HealthStatus.DEGRADED,
                 latency_ms=round(latency, 2),
-                message="Storage service healthy",
+                message=(
+                    "Storage service healthy"
+                    if healthy else f"Storage service degraded: {result.get('error') if isinstance(result, dict) else result}"
+                ),
+                details=result if isinstance(result, dict) else None,
                 last_check=datetime.now()
             )
-            
+
         except asyncio.TimeoutError:
             latency = (time.time() - start_time) * 1000
             logger.warning("⏱️ 存储服务健康检查超时")
-            
+
             return ComponentHealth(
                 name="storage",
                 status=HealthStatus.UNHEALTHY,
@@ -319,7 +328,7 @@ class HealthService:
                 message="Storage service timeout",
                 last_check=datetime.now()
             )
-            
+
         except (ValueError, KeyError) as e:
             latency = (time.time() - start_time) * 1000
             logger.error(f"❌ 存储服务健康检查数据错误: {e}")
@@ -424,25 +433,40 @@ class HealthService:
         start_time = time.time()
         
         try:
-            from app.mcp.client_manager import client_manager
-            
-            # 检查MCP客户端管理器
-            mcp_health = await asyncio.wait_for(
-                client_manager.health_check(),
+            from app.mcp.mcp_tool_proxy import get_mcp_proxy
+
+            # 正确的单例入口是 get_mcp_proxy()（MCPClientManager 只是类，没有模块级实例）。
+            # 未配置 MCP_SERVER_URL 时 get_client() 返回 None —— 属正常降级，记为 degraded。
+            proxy = await get_mcp_proxy()
+            client = await asyncio.wait_for(
+                proxy.get_client(),
                 timeout=self.CHECK_TIMEOUT
             )
-            
+
             latency = (time.time() - start_time) * 1000
-            
+
+            if client is None:
+                return ComponentHealth(
+                    name="mcp_services",
+                    status=HealthStatus.DEGRADED,
+                    latency_ms=round(latency, 2),
+                    message="MCP 未配置或不可用（MCP_SERVER_URL 为空）",
+                    last_check=datetime.now()
+                )
+
+            mcp_health = await asyncio.wait_for(
+                client.health_check(),
+                timeout=self.CHECK_TIMEOUT
+            )
+
             return ComponentHealth(
                 name="mcp_services",
                 status=HealthStatus.HEALTHY if mcp_health else HealthStatus.DEGRADED,
                 latency_ms=round(latency, 2),
-                message="MCP services healthy" if mcp_health else "Some MCP services unhealthy",
-                details=mcp_health if isinstance(mcp_health, dict) else None,
+                message="MCP services healthy" if mcp_health else "MCP 服务健康检查失败",
                 last_check=datetime.now()
             )
-            
+
         except asyncio.TimeoutError:
             latency = (time.time() - start_time) * 1000
             logger.warning("⏱️ MCP服务健康检查超时")
@@ -493,15 +517,11 @@ class HealthService:
         
         try:
             from app.middleware.rate_limit_middleware import RateLimitMiddleware
-            from app.main import app
-            
-            # 查找限流中间件
-            rate_limiter = None
-            for handler in app.middleware_stack._middleware:
-                if isinstance(handler, RateLimitMiddleware):
-                    rate_limiter = handler
-                    break
-            
+
+            # RateLimitMiddleware 在 __init__ 时把自身存入类属性 _instance，
+            # 专供跨中间件栈访问（Starlette 的 middleware_stack 不暴露 _middleware）。
+            rate_limiter = RateLimitMiddleware._instance
+
             latency = (time.time() - start_time) * 1000
             
             if rate_limiter:

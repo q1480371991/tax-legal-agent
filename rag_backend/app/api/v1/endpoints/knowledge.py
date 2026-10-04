@@ -242,7 +242,21 @@ async def create_knowledge_base(
 # ==========================================
 # Phase 1: 物理切块落库 | Phase 2: 异步充血
 # ==========================================
+
+# 并发闸门：限制同时处理的文档数。
+# 背景：每个处理任务在向量化阶段会「每 5 块开一次短数据库会话」，且图谱写回与之并发；
+# 批量上传时若全部并行，会瞬间打满 SQLAlchemy 连接池（默认 5+5），
+# 导致任务卡在 QueuePool TimeoutError 后静默死掉、文档永久停在 processing。
+_PROCESS_CONCURRENCY = asyncio.Semaphore(2)
+
+
 async def process_document_task(doc_id: UUID, tenant_id: str):
+    """文档处理入口（带并发闸门）。"""
+    async with _PROCESS_CONCURRENCY:
+        await _process_document_impl(doc_id, tenant_id)
+
+
+async def _process_document_impl(doc_id: UUID, tenant_id: str):
     print(f"[Phase 1] 开始处理文档: {doc_id}, 租户: {tenant_id}")
 
     domain = "general"
@@ -425,6 +439,61 @@ async def process_document_task(doc_id: UUID, tenant_id: str):
         import asyncio as _asyncio
         _asyncio.ensure_future(_run_phase2_enrichment(doc_id, tenant_id, chunks_to_insert))
 
+    # Phase 3: 知识图谱抽取（异步，不阻塞主流程；仅在图谱开关开启时真正工作）
+    if getattr(settings, "ENABLE_KNOWLEDGE_GRAPH", False) and not first_error_msg:
+        import asyncio as _asyncio
+        _asyncio.ensure_future(_run_kg_ingest(doc_id, tenant_id))
+
+
+async def _run_kg_ingest(doc_id: UUID, tenant_id: str) -> None:
+    """从已入库的 chunk 抽取实体/关系写入 Neo4j（跨库桥接）。
+
+    Fire-and-forget：图谱属增强能力，任何失败都不得影响文档入库主流程。
+    """
+    try:
+        from sqlalchemy import select as _select
+        from app.models.chunk import DocumentChunk
+        from app.knowledge_graph.ingest_bridge import kg_ingest_bridge
+
+        # 取出该文档全部 chunk（id + 文本），按 chunk_index 排序
+        async with AsyncSessionLocal() as db:
+            if not settings.PGBOUNCER_ENABLED:
+                from app.middleware.tenant_middleware import set_tenant_context_for_db
+                await set_tenant_context_for_db(db, tenant_id)
+            result = await db.execute(
+                _select(DocumentChunk.id, DocumentChunk.content)
+                .where(DocumentChunk.document_id == doc_id)
+                .order_by(DocumentChunk.chunk_index)
+            )
+            chunk_pairs = [(str(cid), content or "") for cid, content in result.all()]
+
+        if not chunk_pairs:
+            return
+
+        print(f"[Phase 3] 开始图谱抽取: {doc_id}, chunk 数: {len(chunk_pairs)}")
+        stats = await kg_ingest_bridge.build_from_chunks(
+            chunks=chunk_pairs,
+            tenant_id=tenant_id,
+            document_id=str(doc_id),
+        )
+        print(f"[Phase 3] 图谱抽取完成: 实体 {stats.get('entities')}, 关系 {stats.get('relations')}")
+
+        # 把统计写回文档 meta_info，供前端展示
+        if stats.get("entities") or stats.get("relations"):
+            async with AsyncSessionLocal() as db:
+                if not settings.PGBOUNCER_ENABLED:
+                    from app.middleware.tenant_middleware import set_tenant_context_for_db
+                    await set_tenant_context_for_db(db, tenant_id)
+                d = await db.get(Document, doc_id)
+                if d:
+                    meta = d.meta_info or {}
+                    meta["kg_entities"] = stats.get("entities", 0)
+                    meta["kg_relations"] = stats.get("relations", 0)
+                    d.meta_info = meta
+                    await db.commit()
+    except Exception as e:
+        print(f"[Phase 3] 图谱抽取失败（不影响入库）: {e}")
+
 
 async def _record_multimodal_usage(doc_id: UUID, tenant_id: str, structured_doc) -> None:
     """将解析出的表格块送入 MultiModalService，使多模态解析与用量统计在入库时真实发生。
@@ -504,7 +573,7 @@ async def _run_phase2_enrichment(doc_id: UUID, tenant_id: str, chunks: list):
         from app.chunkers.entity_resolver import entity_resolver
         from app.chunkers.base_chunker import ChunkResult as CR3
         from app.models.chunk import DocumentChunk
-        from app.models.structured_document import StructuredDocument, DocumentBlock, BlockType, DocumentMetadata
+        from app.models.structured_document import StructuredDocument, DocumentBlock, BlockType, DocumentMetadata, DocumentType
         from sqlalchemy import select, update
 
         async with AsyncSessionLocal() as db:
@@ -525,8 +594,10 @@ async def _run_phase2_enrichment(doc_id: UUID, tenant_id: str, chunks: list):
                 preamble_text = preamble_text[:3000]
 
                 # 构建简化的 StructuredDocument（仅含 preamble）
+                # Phase 2 是从已入库的 chunk 重建文档，本质是纯文本重建，故用 TEXT 类型。
                 simple_doc = StructuredDocument(
                     title="",
+                    doc_type=DocumentType.TEXT,
                     metadata=DocumentMetadata(),
                 )
                 if preamble_text:
