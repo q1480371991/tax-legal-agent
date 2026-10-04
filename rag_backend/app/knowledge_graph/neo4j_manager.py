@@ -608,6 +608,73 @@ class Neo4jManager:
 
             return [record['memory_id'] for record in result]
 
+    def find_chunk_ids_by_entities(
+        self,
+        entity_names: List[str],
+        tenant_id: str,
+        max_depth: int = 1,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        """级联融合用：从一批实体出发，多跳扩展，收集关联的 chunk_ids 与路径。
+
+        实体的 chunk_ids 属性由摄取阶段（ingest_bridge）写入，记录该实体
+        出现在哪些 Postgres chunk 里 —— 这就是「图谱 → 原文」的跨库桥接。
+
+        Returns:
+            {
+              "chunk_ids": [...],          # 命中的 chunk（按跳数升序去重）
+              "chunk_distances": {cid: dist},  # 每个 chunk 的最小跳数（供 graph_rank 排序）
+              "entities": [{name,type,distance}, ...],
+              "relations": [{source,target,type}, ...],
+            }
+        """
+        if not self.driver or not entity_names:
+            return {"chunk_ids": [], "chunk_distances": {}, "entities": [], "relations": []}
+
+        tenant_id = str(tenant_id) if tenant_id else None
+        try:
+            with self.driver.session(database=settings.NEO4J_DATABASE) as session:
+                query = Query("""
+                    MATCH path = (e:Entity)-[*0..%d]-(related:Entity)
+                    WHERE (e.name IN $names)
+                      AND (e.tenant_id IS NULL OR e.tenant_id = $tenant_id)
+                    WITH related, length(path) AS dist
+                    RETURN DISTINCT related.name AS name,
+                           related.type AS type,
+                           related.chunk_ids AS chunk_ids,
+                           dist
+                    ORDER BY dist
+                    LIMIT $limit
+                """ % max_depth)
+                result = session.run(
+                    query, names=entity_names, tenant_id=tenant_id, limit=limit
+                )
+                chunk_ids: List[str] = []
+                chunk_distances: Dict[str, int] = {}
+                entities: List[Dict] = []
+                for record in result:
+                    entities.append({
+                        "name": record["name"],
+                        "type": record["type"],
+                        "distance": record["dist"],
+                    })
+                    dist = record["dist"]
+                    for cid in (record["chunk_ids"] or []):
+                        if cid not in chunk_distances:
+                            chunk_ids.append(cid)
+                            chunk_distances[cid] = dist
+                        elif dist < chunk_distances[cid]:
+                            chunk_distances[cid] = dist
+                return {
+                    "chunk_ids": chunk_ids,
+                    "chunk_distances": chunk_distances,
+                    "entities": entities,
+                    "relations": [],
+                }
+        except Exception as e:
+            logger.warning(f"[Neo4j] 按实体查 chunk 失败: {e}")
+            return {"chunk_ids": [], "chunk_distances": {}, "entities": [], "relations": []}
+
     def find_path_between(
         self,
         source_name: str,

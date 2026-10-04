@@ -104,7 +104,24 @@ class UnifiedRetriever:
             jsonb_array_filter=jsonb_array_filter,
         )
 
-        # ── Step 4: Reranker + Cliff Prune ──
+        # ── Step 4: 级联图谱扩展（在 rerank 之前，让图谱 chunk 也参与精排）──
+        # 顺序很重要：原实现在 rerank 之后才做图谱，导致图谱 chunk 是"硬塞在末尾"、
+        # 且不参与 RRF 排序。这里提前到 rerank 前，与第一阶段结果做三源 RRF。
+        #   ① 实体来源是【第一阶段检索到的 chunk】（而非 query）—— 对模糊提问更鲁棒
+        #   ② 用实体的 chunk_ids 反查回【更多原本没检索到的 chunk】
+        graph_chunks: List[Dict] = []
+        if enable_graph and settings.ENABLE_KNOWLEDGE_GRAPH:
+            graph_chunks, graph_results = await self._cascade_graph_expand(
+                query=query, chunks=candidates, kb_id=kb_id, tenant_id=tenant_id, top_k=top_k,
+            )
+            # 三源 RRF：dense + sparse + graph
+            if graph_chunks:
+                candidates = self._fuse_three_sources(
+                    candidates, graph_chunks, domain, top_k=max(50, top_k * 10),
+                )
+            use_graph = bool(graph_results.get("found"))
+
+        # ── Step 5: Reranker + Cliff Prune ──
         if enable_rerank:
             pruned = await self._rerank_and_prune(query, candidates, top_k=top_k)
         else:
@@ -115,27 +132,25 @@ class UnifiedRetriever:
                     c["rerank_score"] = c.get("score") or c.get("rrf_score") or 0.0
             pruned = candidates[: max(1, top_k)]
 
-        # ── Step 4.5: 时序去重 ──
+        # ── Step 5.5: 时序去重 ──
         deduped = await hybrid_search_engine.temporal_dedup(
             chunks=pruned, query_meta=query_meta,
         )
 
-        # ── Step 5: 关系展开 ──
+        # ── Step 6: 关系展开 ──
         enriched = await self._enrich_results(deduped)
 
-        # ── Step 6: Auto-Merging (仅 general) ──
+        # ── Step 6.5: Auto-Merging (仅 general) ──
         if domain in (None, "general"):
             enriched = await hybrid_search_engine.auto_merge(enriched)
 
-        # ── Step 7: 多态 Prompt 组装 ──
+        # ── Step 7: 多态 Prompt 组装（含图谱段）──
         combined_context = await context_assembler.assemble(
             chunks=enriched, domain=domain, query=query,
         )
-
-        # ── 图谱检索（独立于主链路） ──
-        if enable_graph and settings.ENABLE_KNOWLEDGE_GRAPH:
-            graph_results = await self._graph_retrieval(query, kb_id, tenant_id)
-            use_graph = graph_results.get("found", False)
+        # 把图谱信息拼进上下文（原实现在组装之后才检索图谱，导致图谱永远进不了上下文）
+        if graph_results and graph_results.get("context"):
+            combined_context = graph_results["context"] + "\n" + combined_context
 
         return {
             "mode": route_mode.value,
@@ -146,6 +161,330 @@ class UnifiedRetriever:
             "query": query,
             "use_graph": use_graph,
         }
+
+    async def _cascade_graph_expand(
+        self, query: str, chunks: List[Dict], kb_id: str,
+        tenant_id: Optional[str], top_k: int,
+    ):
+        """级联图谱扩展：chunk → 抽实体 → 图谱多跳 → 反查回 chunk。
+
+        Returns: (图谱新增的 chunk 列表（含 graph_rank）, 图谱结果字典)
+
+        注意：不再在这里直接合并到 chunks —— 由调用方用 _fuse_three_sources
+        做三源 RRF，让图谱 chunk 按【跳数】参与排序（跳数小=更相关）。
+        """
+        graph_results: Dict[str, Any] = {"entities": [], "relations": [], "context": "", "found": False}
+        try:
+            resolved_tenant = tenant_id
+            if not resolved_tenant and kb_id:
+                from app.db.session import AsyncSessionLocal as _ASL
+                from app.models.knowledge_base import KnowledgeBase
+                async with _ASL() as db:
+                    row = (await db.execute(
+                        select(KnowledgeBase.tenant_id).where(KnowledgeBase.id == kb_id)
+                    )).scalar_one_or_none()
+                    if row:
+                        resolved_tenant = str(row)
+            if not resolved_tenant:
+                return [], graph_results
+
+            # ① 从【检索到的 chunk】抽实体（级联的关键 —— 不是从 query 抽）
+            chunk_text = "\n".join((c.get("content") or "")[:600] for c in chunks[:5])
+            seed_entities = await self._extract_seed_entities(
+                query, chunk_text, True, resolved_tenant)
+            if not seed_entities:
+                return [], graph_results
+
+            # ② 图谱多跳 + 用 chunk_ids 反查（带跳数，供 graph_rank 排序）
+            from app.knowledge_graph.neo4j_manager import Neo4jManager
+            mgr = Neo4jManager(uri=settings.NEO4J_URI, user=settings.NEO4J_USER,
+                               password=settings.NEO4J_PASSWORD)
+            try:
+                graph_hits = mgr.find_chunk_ids_by_entities(
+                    entity_names=seed_entities, tenant_id=resolved_tenant, max_depth=1, limit=40,
+                )
+            finally:
+                mgr.close()
+
+            hit_ids = [cid for cid in graph_hits.get("chunk_ids", []) if cid]
+            distances = graph_hits.get("chunk_distances", {}) or {}
+            entities = graph_hits.get("entities", [])
+
+            # ③ 取回图谱命中的 chunk（原本不在第一阶段结果里的），按跳数排序
+            existing_ids = {str(c.get("id")) for c in chunks}
+            new_ids = [cid for cid in hit_ids if cid not in existing_ids][: top_k * 2]
+            # graph_rank：跳数升序（跳数越小排名越前）
+            new_ids.sort(key=lambda cid: distances.get(cid, 9))
+
+            graph_chunks: List[Dict] = []
+            if new_ids:
+                from app.db.session import AsyncSessionLocal as _ASL2
+                from app.models.chunk import DocumentChunk
+                import uuid as _uuid
+                async with _ASL2() as db:
+                    try:
+                        uuids = [_uuid.UUID(x) for x in new_ids]
+                    except (ValueError, AttributeError):
+                        uuids = []
+                    if uuids:
+                        rows = (await db.execute(
+                            select(DocumentChunk).where(DocumentChunk.id.in_(uuids))
+                        )).scalars().all()
+                        by_id = {str(r.id): r for r in rows}
+                        for rank, cid in enumerate(new_ids, 1):
+                            r = by_id.get(cid)
+                            if not r:
+                                continue
+                            graph_chunks.append({
+                                "id": str(r.id), "content": r.content,
+                                "domain": r.domain,
+                                "meta_info": r.meta_info or {},
+                                "graph_rank": rank,          # 供三源 RRF 用
+                                "graph_hop": distances.get(cid, 1),
+                                "from_graph": True,
+                            })
+                logger.info(
+                    f"[级联图谱] 种子 {len(seed_entities)} → 图谱新增 {len(graph_chunks)} chunk "
+                    f"(跳数分布: {sorted(set(distances.get(c,1) for c in new_ids))})"
+                )
+
+            # ④ 构造图谱上下文（实体列表，供 prompt 使用）
+            if entities:
+                by_type: Dict[str, List[str]] = {}
+                for e in entities[:20]:
+                    by_type.setdefault(e.get("type", "UNKNOWN"), [])
+                    if e["name"] not in by_type[e["type"]]:
+                        by_type[e["type"]].append(e["name"])
+                parts = ["【知识图谱信息】",
+                         f"（由检索内容中的实体扩展，种子: {', '.join(seed_entities[:5])}）"]
+                for t, names in by_type.items():
+                    parts.append(f"  [{t}] {', '.join(names[:8])}")
+                graph_results = {
+                    "entities": entities, "relations": [],
+                    "context": "\n".join(parts) + "\n",
+                    "found": True, "seed_entities": seed_entities,
+                    "graph_chunk_ids": hit_ids,
+                }
+            return graph_chunks, graph_results
+        except Exception as e:
+            logger.warning(f"[级联图谱] 扩展失败（不影响主检索）: {e}")
+            return [], graph_results
+
+    # 三源 RRF 权重 (dense, sparse, graph) —— 按领域调参
+    # 图谱权重普遍较低：图谱 chunk 是"关联扩展"而非"精确命中"，宜作补充而非主导。
+    _RRF_DOMAIN_WEIGHTS = {
+        "legal":   (0.35, 0.40, 0.25),
+        "tax":     (0.35, 0.35, 0.30),
+        "finance": (0.30, 0.45, 0.25),
+        "general": (0.40, 0.40, 0.20),
+        None:      (0.35, 0.40, 0.25),
+    }
+    _RRF_K = 60
+
+    def _fuse_three_sources(
+        self, candidates: List[Dict], graph_chunks: List[Dict],
+        domain: Optional[str], top_k: int = 50,
+    ) -> List[Dict]:
+        """三源 RRF 融合：dense + sparse + graph。
+
+        与两源 RRF 的区别：图谱路的排名依据是【跳数】——
+        直接相连（hop=1）比隔两跳更相关，是天然的排序信号。
+
+        Args:
+            candidates: 第一阶段结果（含 dense_rank / sparse_rank / content）
+            graph_chunks: 图谱扩展来的新 chunk（含 graph_rank / content）
+            domain: 领域，决定三路权重
+        """
+        w_dense, w_sparse, w_graph = self._RRF_DOMAIN_WEIGHTS.get(
+            domain, self._RRF_DOMAIN_WEIGHTS[None]
+        )
+        k = self._RRF_K
+        scores: Dict[str, float] = {}
+        info: Dict[str, dict] = {}
+
+        def _ensure(cid: str) -> dict:
+            if cid not in info:
+                info[cid] = {}
+            return info[cid]
+
+        for c in candidates:
+            cid = str(c.get("id"))
+            if not cid:
+                continue
+            s = 0.0
+            dr = c.get("dense_rank")
+            if dr:
+                s += w_dense / (k + dr)
+            sr = c.get("sparse_rank")
+            if sr:
+                s += w_sparse / (k + sr)
+            scores[cid] = scores.get(cid, 0.0) + s
+            e = _ensure(cid)
+            e.update({"content": c.get("content", ""), "domain": c.get("domain"),
+                      "meta_info": c.get("meta_info", {})})
+            e["chunk"] = c
+            if dr: e["dense_rank"] = dr
+            if sr: e["sparse_rank"] = sr
+
+        for gc in graph_chunks:
+            cid = str(gc.get("id"))
+            if not cid:
+                continue
+            gr = gc.get("graph_rank") or 1
+            scores[cid] = scores.get(cid, 0.0) + w_graph / (k + gr)
+            e = _ensure(cid)
+            e.setdefault("content", gc.get("content", ""))
+            e.setdefault("domain", gc.get("domain"))
+            e.setdefault("meta_info", gc.get("meta_info", {}))
+            e["chunk"] = gc
+            e["graph_rank"] = gr
+            e["from_graph"] = True
+
+        ordered = sorted(scores, key=scores.get, reverse=True)[:top_k]
+        fused: List[Dict] = []
+        for cid in ordered:
+            e = info[cid]
+            chunk = dict(e.get("chunk") or {})
+            chunk["id"] = cid
+            chunk["content"] = e.get("content", "")
+            chunk["domain"] = e.get("domain")
+            chunk["meta_info"] = e.get("meta_info", {})
+            chunk["rrf_score"] = round(scores[cid], 6)
+            for key in ("dense_rank", "sparse_rank", "graph_rank", "from_graph"):
+                if key in e:
+                    chunk[key] = e[key]
+            fused.append(chunk)
+
+        # ── 图谱保底配额 ──
+        # 问题：图谱路权重天然低（它是「关联补充」而非「精确命中」），
+        # 三源 RRF 后图谱 chunk 会全部沉底，必然被下游 top_k 截掉 —— 级联就白做了。
+        # 对策：在融合结果里为图谱 chunk 预留一个配额位（插到前段），
+        # 保证「图谱确实补充了内容」这一设计意图不被排序淹没。
+        # 配额保守（≤新增数的 1/3 且 ≤2），避免图谱噪音挤掉精确命中。
+        graph_items = [c for c in fused if c.get("from_graph")]
+        if graph_items:
+            quota = min(2, max(1, len(graph_items) // 3))
+            graph_items.sort(key=lambda c: (c.get("graph_rank") or 99))
+            keep = graph_items[:quota]
+            rest = [c for c in fused if not (c.get("from_graph") and c in keep)]
+            # 插到第 2 位之后（不喧宾夺主，但保证进入下游可见范围）
+            insert_at = min(2, len(rest))
+            fused = rest[:insert_at] + keep + rest[insert_at:]
+        return fused
+
+
+    # 通用词黑名单：这些词做种子会匹配到大量无关 chunk（如"企业"命中"企业所得税""万科企业股份有限公司"）
+    _SEED_STOPWORDS = {
+        "企业", "公司", "集团", "银行", "子公司", "母公司", "控股", "股份",
+        "所得税", "税率", "税额", "税种", "收入", "成本", "费用", "利润",
+        "资产", "负债", "权益", "现金", "余额", "金额", "合计", "本期",
+        "报告", "年度", "期间", "项目", "业务", "服务", "产品", "客户",
+        "上述", "本次", "该", "此", "相关", "其他", "以下", "以上",
+    }
+    # 有区分度的实体类型（优先选这些做种子）
+    _SEED_PREFERRED_TYPES = {"COMPANY", "PERSON", "CONTRACT", "REGULATION",
+                             "TAX_TYPE", "TAX_POLICY", "PRODUCT", "EVENT", "LOCATION"}
+
+    # 公司/机构后缀（剥离后得到"核心名"，用于简称匹配）
+    _NAME_SUFFIXES = ("股份有限公司", "有限责任公司", "有限公司", "集团有限公司",
+                      "集团", "公司", "事务所", "银行", "分行", "董事会", "委员会")
+
+    def _name_matches(self, entity_name: str, text: str) -> bool:
+        """实体名与文本的双向匹配。
+
+        处理两种情形：
+        1. 实体全名出现在文本里：'万科企业股份有限公司' ⊂ 文本
+        2. 文本里提到实体简称：query='万科有哪些子公司'，实体='万科企业股份有限公司'
+           → 剥离公司后缀得核心名 '万科企业'，再看其前缀（≥2字）是否在文本中。
+        """
+        if not text:
+            return False
+        if entity_name in text:
+            return True
+        # 剥后缀得核心名
+        core = entity_name
+        for suf in self._NAME_SUFFIXES:
+            if core.endswith(suf) and len(core) > len(suf):
+                core = core[:-len(suf)]
+                break
+        if len(core) < 2:
+            return False
+        # 核心名的前缀（2 字起，逐级加长）出现在文本中即算命中
+        for L in range(2, len(core) + 1):
+            if core[:L] in text:
+                # 至少匹配到 2 个连续字，且不是纯通用词
+                seg = core[:L]
+                if seg not in self._SEED_STOPWORDS:
+                    return True
+        return False
+
+    async def _extract_seed_entities(self, query: str, chunk_text: str,
+                                     need_graph: bool, tenant_id: Optional[str] = None) -> List[str]:
+        """级联实体抽取：优先从【检索到的 chunk】抽，回退到 query。
+
+        对模糊提问（query 里没实体）尤为关键 —— chunk 里有实体，query 里没有。
+
+        精度控制（关键）：种子实体必须【有区分度】——
+        - 排除通用词（企业/公司/所得税/税率…），否则会匹配到海量无关 chunk
+        - 优先具体类型（COMPANY/PERSON/CONTRACT…），跳过 DATE_PERIOD 等泛类型
+        - 长度 ≥ 4（2-3 字的中文词多为通用词）
+        """
+        names: List[str] = []
+
+        # 一次拉取图谱里【有区分度】的实体（类型限定 + 长度 ≥ 4 + 按 chunk 数排序）。
+        # 关键：必须在 Cypher 里排序+限流，否则无序 LIMIT 会扫不到靠后的重要实体
+        # （如"万科企业股份有限公司"有 108 个 chunk，却因无序截断而漏掉）。
+        candidates: List[tuple] = []   # (name, type)
+        try:
+            from app.knowledge_graph.neo4j_manager import Neo4jManager
+            mgr = Neo4jManager(uri=settings.NEO4J_URI, user=settings.NEO4J_USER,
+                               password=settings.NEO4J_PASSWORD)
+            try:
+                with mgr.driver.session(database=settings.NEO4J_DATABASE) as s:
+                    rows = s.run(
+                        "MATCH (e:Entity) "
+                        "WHERE (e.tenant_id IS NULL OR e.tenant_id = $t) "
+                        "AND e.name IS NOT NULL AND size(e.name) >= 4 "
+                        "AND e.type IN $types "
+                        "RETURN e.name AS name, e.type AS type "
+                        "ORDER BY size(coalesce(e.chunk_ids,[])) DESC LIMIT 3000",
+                        t=str(tenant_id) if tenant_id else None,
+                        types=list(self._SEED_PREFERRED_TYPES))
+                    for r in rows:
+                        n = r["name"]
+                        if n and n not in self._SEED_STOPWORDS:
+                            candidates.append((n, r["type"]))
+            finally:
+                mgr.close()
+        except Exception as e:
+            logger.debug(f"[级联图谱] 实体候选拉取失败: {e}")
+
+        # ① 优先：名字与 query 匹配的实体（最可靠）
+        for n, t in candidates:
+            if self._name_matches(n, query):
+                names.append(n)
+                if len(names) >= 8:
+                    break
+
+        # ② 补充：从【检索到的 chunk】里匹配（处理"这家公司"这类 query 无实体）
+        if not names and chunk_text:
+            for n, t in candidates:
+                if self._name_matches(n, chunk_text):
+                    names.append(n)
+                    if len(names) >= 8:
+                        break
+
+
+        # ③ 最后的回退：jieba 从 query 抽（过滤通用词）
+        if not names:
+            try:
+                from app.services.graph_retriever import graph_retriever
+                raw = await graph_retriever.extract_entities_from_query(query)
+                names = [n for n in raw if len(n) >= 4 and n not in self._SEED_STOPWORDS]
+            except Exception:
+                names = []
+        return names[:8]
+
 
     async def _rerank_and_prune(
         self, query: str, candidates: List[Dict], top_k: int = 10,
@@ -182,10 +521,30 @@ class UnifiedRetriever:
             top_k=max(final_k, 10), lambda_param=0.6,
         )
 
-        return cliff_prune(
+        pruned = cliff_prune(
             items=mmr_result, score_key="rerank_score",
             min_results=min(3, final_k), max_results=final_k, cliff_threshold=0.15,
         )
+
+        # ── 图谱 chunk 保底补回 ──
+        # 图谱 chunk 是「关联扩展」而非「精确命中」，按相关性打分天然偏低，
+        # 会被 cliff_prune 截掉 —— 那级联融合就白做了。
+        # 这里把图谱 chunk 单独补回（不占常规配额，最多 2 条），确保「图谱补充关联」
+        # 的设计意图真正落地。它们已通过 RRF 前段插入证明过相关性。
+        pruned_ids = {str(c.get("id")) for c in pruned}
+        graph_survivors = [
+            c for c in candidates
+            if c.get("from_graph") and str(c.get("id")) not in pruned_ids
+        ]
+        # 按 graph_rank（跳数）取最优的 2 条
+        graph_survivors.sort(key=lambda c: c.get("graph_rank") or 99)
+        for gc in graph_survivors[:2]:
+            gc.setdefault("rerank_score", 0.0)
+            pruned.append(gc)
+        if graph_survivors[:2]:
+            logger.info(f"[级联图谱] 补回 {len(graph_survivors[:2])} 条图谱 chunk（免于 cliff 截断）")
+
+        return pruned
 
     async def _mmr_rerank(
         self, query: str, candidates: List[Dict],
@@ -254,41 +613,6 @@ class UnifiedRetriever:
         nb = sum(x * x for x in b) ** 0.5
         return dot / (na * nb) if na and nb else 0.0
 
-    async def _graph_retrieval(
-        self, query: str, kb_id: str, tenant_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """图谱检索（独立分支）"""
-        resolved_tenant_id = tenant_id
-        if not resolved_tenant_id and kb_id:
-            try:
-                from app.db.session import AsyncSessionLocal as _ASL
-                from app.models.knowledge_base import KnowledgeBase
-                async with _ASL() as db:
-                    result = await db.execute(
-                        select(KnowledgeBase.tenant_id).where(KnowledgeBase.id == kb_id)
-                    )
-                    row = result.scalar_one_or_none()
-                    if row:
-                        resolved_tenant_id = str(row)
-            except Exception:
-                pass
-
-        if not resolved_tenant_id:
-            return {"entities": [], "relations": [], "context": "", "found": False}
-
-        try:
-            from app.services.graph_query_classifier import graph_query_classifier
-            _, need_graph = await graph_query_classifier.classify(query)
-            if need_graph:
-                from app.services.graph_retriever import graph_retriever
-                return await graph_retriever.retrieve_context(
-                    query=query, tenant_id=resolved_tenant_id, top_k=5,
-                )
-        except Exception as e:
-            logger.warning(f"[Graph] 检索失败: {e}")
-
-        return {"entities": [], "relations": [], "context": "", "found": False}
-
     async def _enrich_results(self, results: List[Dict]) -> List[Dict]:
         """富化结果：PARENT 摘要 + PREVIOUS/NEXT 展开"""
         if not results:
@@ -327,92 +651,6 @@ class UnifiedRetriever:
         except Exception as e:
             print(f"⚠️ [Memory 检索] 失败: {e}")
             return {"working": [], "episodic": [], "semantic": []}
-    
-    def _combine_context(
-        self,
-        rag_results: List[Any],
-        memory_results: Dict[str, List[MemoryItem]],
-        graph_results: Dict[str, Any],
-        mode: RouteMode
-    ) -> str:
-        """
-        合并 RAG、Memory 和 Graph 的上下文
-        
-        优先级：Memory > Graph > RAG
-        
-        Args:
-            rag_results: RAG 检索结果
-            memory_results: Memory 检索结果
-            graph_results: Graph 检索结果
-            mode: 路由模式
-            
-        Returns:
-            格式化的上下文字符串
-        """
-        context_parts = []
-        
-        if memory_results:
-            if memory_results.get("working"):
-                working_context = "【当前对话】\n"
-                for item in memory_results["working"]:
-                    working_context += f"{item.role}: {item.content}\n"
-                context_parts.append(working_context)
-            
-            if memory_results.get("semantic"):
-                semantic_context = "\n【个人知识库】\n"
-                for item in memory_results["semantic"][:3]:
-                    semantic_context += f"- {item.content}\n"
-                context_parts.append(semantic_context)
-            
-            if memory_results.get("episodic"):
-                episodic_context = "\n【相关历史】\n"
-                for item in memory_results["episodic"][:2]:
-                    episodic_context += f"{item.role}: {item.content[:100]}...\n"
-                context_parts.append(episodic_context)
-        
-        if graph_results and graph_results.get("context"):
-            context_parts.append(graph_results["context"])
-        
-        if rag_results:
-            rag_context = "\n<KnowledgeBase>\n"
-            for idx, result in enumerate(rag_results[:5], 1):
-                # PARENT 摘要（含 Phase 2 降级兜底）
-                parent_summary = getattr(result, "parent_summary", None)
-                if parent_summary:
-                    rag_context += f"[上下文概况]: {parent_summary}\n"
-                rag_context += f"{idx}. {result.content[:200]}...\n"
-                rag_context += f"   来源: {result.source_file}"
-                if hasattr(result, "score") and result.score is not None:
-                    rag_context += f" | 相似度: {float(result.score):.2%}"
-                if getattr(result, "answerability_score", None) is not None:
-                    rag_context += f" | 可回答性: {float(result.answerability_score):.2%}"
-                flags = getattr(result, "evidence_flags", None) or {}
-                if flags:
-                    quality_notes = []
-                    if flags.get("has_process_steps"):
-                        quality_notes.append("包含流程步骤")
-                    elif flags.get("asks_process"):
-                        quality_notes.append("缺少明确流程步骤")
-                    if flags.get("is_code_or_plan_fragment"):
-                        quality_notes.append("偏代码/方案片段")
-                    if not flags.get("enough_context", True):
-                        quality_notes.append("上下文不足")
-                    if flags.get("top_gap_clear"):
-                        quality_notes.append("top1分差明显")
-                    if quality_notes:
-                        rag_context += f" | 证据质量: {'、'.join(quality_notes)}"
-                rag_context += "\n\n"
-            rag_context += "</KnowledgeBase>\n"
-            context_parts.append(rag_context)
-        
-        if mode == RouteMode.HYBRID:
-            context_parts.insert(0, "<ContextSource type='hybrid'>以下内容包含知识库文档和个人对话记忆\n")
-        elif mode == RouteMode.MEMORY_ONLY:
-            context_parts.insert(0, "<ContextSource type='memory'>以下内容来自个人对话记忆\n")
-        elif mode == RouteMode.RAG_ONLY:
-            context_parts.insert(0, "<ContextSource type='rag'>以下内容来自知识库文档\n")
-        
-        return "\n".join(context_parts)
     
     async def get_formatted_context_for_llm(
         self,
@@ -477,16 +715,21 @@ class UnifiedRetriever:
                     return None
 
                 parent_id = chunk.relationships.get("PARENT")
-                if not parent_id:
+                if parent_id is None:
                     return None
 
+                # 关系里存的是「同一文档内的 chunk_index」（与 chunker 分配的位置一致），
+                # 不是数据库 UUID，因此按 (document_id, chunk_index) 定位父节点。
                 try:
-                    parent_uuid = uuid.UUID(str(parent_id))
-                except (ValueError, AttributeError):
+                    parent_idx = int(parent_id)
+                except (ValueError, TypeError):
                     return None
 
                 parent_result = await db.execute(
-                    select(DocumentChunk).where(DocumentChunk.id == parent_uuid)
+                    select(DocumentChunk).where(
+                        DocumentChunk.document_id == chunk.document_id,
+                        DocumentChunk.chunk_index == parent_idx,
+                    )
                 )
                 parent = parent_result.scalar_one_or_none()
                 if not parent:
@@ -534,30 +777,38 @@ class UnifiedRetriever:
                 next_content = None
 
                 prev_id = chunk.relationships.get("PREVIOUS")
-                if prev_id:
+                if prev_id is not None:
                     try:
-                        prev_uuid = uuid.UUID(str(prev_id))
+                        prev_idx = int(prev_id)
+                    except (ValueError, TypeError):
+                        prev_idx = None
+                    if prev_idx is not None:
                         prev_result = await db.execute(
-                            select(DocumentChunk).where(DocumentChunk.id == prev_uuid)
+                            select(DocumentChunk).where(
+                                DocumentChunk.document_id == chunk.document_id,
+                                DocumentChunk.chunk_index == prev_idx,
+                            )
                         )
                         prev = prev_result.scalar_one_or_none()
                         if prev:
                             prev_content = prev.content[:max_chars]
-                    except (ValueError, AttributeError):
-                        pass
 
                 next_id = chunk.relationships.get("NEXT")
-                if next_id:
+                if next_id is not None:
                     try:
-                        next_uuid = uuid.UUID(str(next_id))
+                        next_idx = int(next_id)
+                    except (ValueError, TypeError):
+                        next_idx = None
+                    if next_idx is not None:
                         next_result = await db.execute(
-                            select(DocumentChunk).where(DocumentChunk.id == next_uuid)
+                            select(DocumentChunk).where(
+                                DocumentChunk.document_id == chunk.document_id,
+                                DocumentChunk.chunk_index == next_idx,
+                            )
                         )
                         nxt = next_result.scalar_one_or_none()
                         if nxt:
                             next_content = nxt.content[:max_chars]
-                    except (ValueError, AttributeError):
-                        pass
 
                 return {"previous": prev_content, "next": next_content}
 

@@ -93,6 +93,45 @@ class RelationExtractor:
             callback(f"关系提取最终失败: {last_error}")
         return []
 
+
+    @staticmethod
+    def _extract_first_json_array(text: str):
+        """从文本中提取第一个完整、配平的 JSON 数组（正确处理嵌套）。
+
+        LLM 有时返回 "[] 无关系" 或多个数组，直接 json.loads 会报 Extra data。
+        这里做括号配平扫描，找到第一个闭合的 [...] 再解析。
+        返回 list 或 None。
+        """
+        start = text.find('[')
+        if start == -1:
+            return None
+        depth = 0
+        in_str = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == '\\':
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        result = json.loads(text[start:i + 1])
+                        return result if isinstance(result, list) else None
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
     async def _extract_once(
         self,
         text: str,
@@ -167,7 +206,18 @@ class RelationExtractor:
 
         logger.info(f"准备解析 JSON，长度: {len(response)}")
 
-        relations = json.loads(response)
+        # JSON 容错：LLM 有时会在数组前后附带说明文字（触发 "Extra data" 报错），
+        # 这里截取第一个 [...] 数组再解析。
+        try:
+            relations = json.loads(response)
+        except json.JSONDecodeError:
+            # 容错：LLM 可能在数组后附说明文字（如 "[] 无关系"）、或多个数组。
+            # 用 regex 提取第一个完整 JSON 数组。
+            relations = self._extract_first_json_array(response)
+            if relations is None:
+                logger.warning(f"响应中无有效 JSON 数组，前100字: {response[:100]}")
+                return []
+            logger.info("JSON 容错：已从响应中提取数组解析")
 
         logger.info(f"JSON 解析完成，关系数量: {len(relations)}")
 
@@ -179,12 +229,20 @@ class RelationExtractor:
         filtered_relations = []
         invalid_type_count = 0
         for r in relations:
-            if not isinstance(r, dict) or 'source' not in r or 'target' not in r:
+            if not isinstance(r, dict):
                 continue
-            rtype = r.get('type', '')
+            # 字段别名兼容：LLM 可能返回 head/relation/tail 而非 source/type/target
+            src = r.get('source') or r.get('head') or r.get('subject')
+            tgt = r.get('target') or r.get('tail') or r.get('object')
+            rtype = r.get('type') or r.get('relation') or r.get('predicate') or ''
+            if not src or not tgt:
+                continue
+            r['source'] = src
+            r['target'] = tgt
+            r['type'] = rtype
             if rtype not in self.VALID_RELATION_TYPES:
                 invalid_type_count += 1
-                logger.debug(f"跳过未定义的关系类型: {rtype} ({r.get('source')}→{r.get('target')})")
+                logger.debug(f"跳过未定义的关系类型: {rtype} ({src}→{tgt})")
                 continue
             filtered_relations.append(r)
 

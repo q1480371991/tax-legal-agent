@@ -27,6 +27,25 @@ class EntityExtractor:
     # 所有合法实体类型的集合，用于后验证过滤
     VALID_ENTITY_TYPES: set = set(ENTITY_TYPE_DESCRIPTIONS.keys())
 
+    # 税率上下文词：只有出现在百分数附近，才认定该百分数是「税率」。
+    # 否则财报里的股权比例/增长率/占比（如 47.50%）会被误判为税率。
+    TAX_CONTEXT_WORDS = (
+        "税率", "征收率", "减按", "扣除率", "从价", "从量", "税收", "适用",
+    )
+    # 税率合理范围（%）：税率不可能超过 100%，实际业务中极少超过 50%。
+    TAX_RATE_MAX = 100.0
+
+    # 合同名黑名单：含这些词的是句子片段或指代，不是合同名称。
+    CONTRACT_BLACKLIST = (
+        "上述", "本次", "该", "此", "期限", "不存在", "履行", "相关",
+        "包括", "签署", "签订", "等", "并", "按照", "因",
+    )
+    # 合同名长度上限（中文字符）
+    CONTRACT_MAX_LEN = 20
+
+    # 财务指标黑名单：这些不是指标（金额本身、单位、通用词）
+    METRIC_BLACKLIST = ("人民币元", "金额", "本期", "上年", "期末", "年初", "余额")
+
     def __init__(self):
         self.confidence_threshold = getattr(settings, 'ENTITY_CONFIDENCE_THRESHOLD', 0.7)
         self.max_concurrency = getattr(settings, 'EXTRACTION_CONCURRENCY', 5)
@@ -121,9 +140,22 @@ class EntityExtractor:
         for m in re.findall(r'\d{4}年(?:\d{1,2}月)?(?:第[一二三四]季度)?', text):
             entities.append({"name": m, "type": "DATE_PERIOD", "confidence": 1.0})
 
-        # 2. TAX_RATE: 百分数税率
-        for m in re.findall(r'\d+(?:\.\d+)?[%％]', text):
-            entities.append({"name": m, "type": "TAX_RATE", "confidence": 0.95})
+        # 2. TAX_RATE: 仅在「税率语境」下的百分数才算税率。
+        #    财报里的股权比例/增长率/占比（47.50%、220%）不是税率，必须靠上下文区分。
+        for m in re.finditer(r'(\d+(?:\.\d+)?)\s*[%％]', text):
+            ctx = text[max(0, m.start() - 12):m.start()]
+            if not any(w in ctx for w in self.TAX_CONTEXT_WORDS):
+                continue
+            try:
+                val = float(m.group(1))
+            except ValueError:
+                continue
+            if 0 < val <= self.TAX_RATE_MAX:
+                entities.append({
+                    "name": f"{m.group(1)}%",
+                    "type": "TAX_RATE",
+                    "confidence": 0.95,
+                })
 
         # 3. TAX_TYPE: 常见税种字典
         for tt in ['企业所得税', '增值税', '印花税', '营业税', '个人所得税',
@@ -133,12 +165,15 @@ class EntityExtractor:
 
         # 4. CONTRACT: 2-6字 + 协议/合同，去除非实体前缀
         for m in re.findall(r'[\u4e00-\u9fa5]{2,6}(?:协议|合同)', text):
-            for prefix in ['了', '的', '与', '和', '及', '或', '签署']:
+            for prefix in ['了', '的', '与', '和', '及', '或', '签署', '署了', '订了', '订']:
                 if m.startswith(prefix):
                     m = m[len(prefix):]
                     break
-            if len(m) >= 2:  # 去掉前缀后至少2字
-                entities.append({"name": m, "type": "CONTRACT", "confidence": 0.95})
+            if len(m) < 4 or len(m) > self.CONTRACT_MAX_LEN:
+                continue
+            if any(bad in m for bad in self.CONTRACT_BLACKLIST):
+                continue
+            entities.append({"name": m, "type": "CONTRACT", "confidence": 0.95})
 
         # 5. CLAUSE: 2-6字 + 条款，去除非实体前缀
         for m in re.findall(r'[\u4e00-\u9fa5]{2,6}条款', text):
@@ -173,6 +208,12 @@ class EntityExtractor:
         ]
         for pattern, conf in metric_pairs:
             for m in re.findall(pattern, text):
+                # 必须含中文指标名（排除"人民币元""金额（xxx元）"这类无名字的纯金额）
+                if not re.search(r'[一-龥]{2,}', m):
+                    continue
+                # 排除明显的非指标词
+                if any(bad in m for bad in self.METRIC_BLACKLIST):
+                    continue
                 entities.append({"name": m, "type": "FINANCIAL_METRIC", "confidence": conf})
 
         # 8. COMPANY: 知名公司字典（常用于测试文本）
@@ -201,16 +242,18 @@ class EntityExtractor:
         """单次实体提取（规则预提取 + LLM 补全）"""
         original_text = text
 
-        # 第 0 步：规则预提取
+        # 第 0 步：规则预提取（仅作补充，不再独占）
+        # 设计变更：原实现「规则命中即 return」会让 LLM 完全缺席，
+        # 导致规则正则的误抽（如把股权比例 47.50% 当税率）无人纠正。
+        # 现在规则与 LLM 结果合并去重，LLM 负责语义层面的实体。
         rule_entities = self._pre_extract_by_rules(text)
         if rule_entities:
             logger.info(
-                f"规则预提取到 {len(rule_entities)} 个实体，跳过 LLM 提取: "
-                f"{[e['name'] for e in rule_entities]}"
+                f"规则预提取到 {len(rule_entities)} 个实体（将与 LLM 结果合并）: "
+                f"{[e['name'] for e in rule_entities][:8]}"
             )
-            return rule_entities
 
-        # 规则未提取到 -> 走 LLM
+        # 走 LLM（始终执行）
         if resolve_coreference:
             try:
                 from app.knowledge_graph.coreference_resolver import coreference_resolver
@@ -325,7 +368,13 @@ class EntityExtractor:
         if low_confidence:
             logger.warning(f"低置信度实体（已过滤）: {[e['name'] for e in low_confidence]}")
 
-        return high_confidence
+        # 合并规则实体（按 名称+类型 去重，LLM 结果优先）
+        merged = self._merge_entities(high_confidence + rule_entities)
+        logger.info(
+            f"合并后实体总数: {len(merged)}"
+            f"（LLM {len(high_confidence)} + 规则 {len(rule_entities)}，去重后）"
+        )
+        return merged
 
     async def extract_batch(
         self,
