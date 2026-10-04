@@ -225,39 +225,75 @@ class HybridSearchEngine:
         if not chunks:
             return []
 
+        from app.models.chunk import DocumentChunk
+        from app.db import AsyncSessionLocal
+        from sqlalchemy import select
+        import uuid as _uuid
+
+        # 检索结果里不含 relationships（search_service 只返回 id/content/domain/meta_info），
+        # 需按 chunk id 回查数据库取 PARENT 指针。
+        # relationships 里存的是「同一文档内的 chunk_index」，不是 UUID。
+        ids = []
+        for c in chunks:
+            cid = c.get("id")
+            try:
+                ids.append(_uuid.UUID(str(cid)))
+            except (ValueError, TypeError):
+                continue
+
+        chunk_rel: Dict[str, dict] = {}      # chunk_id -> {"parent_idx": int, "doc_id": str}
+        if ids:
+            async with AsyncSessionLocal() as db:
+                rows = (await db.execute(
+                    select(DocumentChunk.id, DocumentChunk.document_id,
+                           DocumentChunk.relationships)
+                    .where(DocumentChunk.id.in_(ids))
+                )).all()
+            for cid, doc_id, rel in rows:
+                if isinstance(rel, dict) and rel.get("PARENT") is not None:
+                    try:
+                        pidx = int(rel["PARENT"])
+                    except (ValueError, TypeError):
+                        continue
+                    chunk_rel[str(cid)] = {"parent_idx": pidx, "doc_id": str(doc_id)}
+
+        if not chunk_rel:
+            return chunks
+
+        # 统计每个 (doc_id, parent_idx) 被命中几次
         parent_hits: Dict[str, List[int]] = {}
+        key_meta: Dict[str, dict] = {}
         for idx, chunk in enumerate(chunks):
-            meta = chunk.get("meta_info") or {}
-            relationships = meta.get("relationships") if isinstance(meta, dict) else {}
-            if not isinstance(relationships, dict):
-                relationships = {}
-            parent_id = relationships.get("PARENT")
-            if parent_id:
-                parent_hits.setdefault(str(parent_id), []).append(idx)
+            info = chunk_rel.get(str(chunk.get("id")))
+            if not info:
+                continue
+            key = f"{info['doc_id']}::{info['parent_idx']}"
+            parent_hits.setdefault(key, []).append(idx)
+            key_meta[key] = info
 
         parents_to_merge = {
-            pid: indices for pid, indices in parent_hits.items()
-            if len(indices) >= min_hits_per_parent
+            k: idxs for k, idxs in parent_hits.items()
+            if len(idxs) >= min_hits_per_parent
         }
 
         if not parents_to_merge:
             return chunks
 
-        from app.models.chunk import DocumentChunk
-        from app.db import AsyncSessionLocal
-        from sqlalchemy import select
-
+        # 按 (document_id, chunk_index) 取父节点全文
         merged_parents: Dict[str, Dict] = {}
         async with AsyncSessionLocal() as db:
-            for pid in parents_to_merge:
+            for key, idxs in parents_to_merge.items():
+                info = key_meta[key]
                 try:
-                    parent_uuid = uuid.UUID(pid)
                     result = await db.execute(
-                        select(DocumentChunk).where(DocumentChunk.id == parent_uuid)
+                        select(DocumentChunk).where(
+                            DocumentChunk.document_id == _uuid.UUID(info["doc_id"]),
+                            DocumentChunk.chunk_index == info["parent_idx"],
+                        )
                     )
                     parent = result.scalar_one_or_none()
                     if parent:
-                        merged_parents[pid] = {
+                        merged_parents[key] = {
                             "id": str(parent.id),
                             "content": parent.content,
                             "domain": parent.domain or "general",

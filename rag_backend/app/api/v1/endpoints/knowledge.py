@@ -541,12 +541,6 @@ async def _run_phase2_enrichment(doc_id: UUID, tenant_id: str, chunks: list):
     from app.models.document_enrichment_job import EnrichmentJob
     print(f"[Phase 2] 开始 legal 文档充血: {doc_id}")
 
-    # 收集 PARENT chunk ID
-    parent_chunk_ids = [
-        str(c.id) for c in chunks
-        if hasattr(c, 'node_type') and c.node_type == 'parent'
-    ]
-
     # 创建任务记录
     job_ids = []
     async with AsyncSessionLocal() as db:
@@ -637,46 +631,67 @@ async def _run_phase2_enrichment(doc_id: UUID, tenant_id: str, chunks: list):
         import traceback; traceback.print_exc()
 
     # ── 执行摘要生成 ──
-    if parent_chunk_ids:
-        print(f"[Phase 2] 开始摘要生成: {doc_id}, {len(parent_chunk_ids)} 个 PARENT")
-        try:
-            from app.chunkers.summary_generator import summary_generator, ChunkResult as CR2
-            from app.models.chunk import DocumentChunk
-            from sqlalchemy import select, update
+    # 注意：不依赖调用方传入的 chunks 列表 —— process_document_task 中
+    # chunks_to_insert 在最后一轮批量提交后已被重置为空列表，导致此处恒为空、
+    # 整段摘要生成被跳过（实测「开始摘要生成」日志从未出现）。改为直接查库。
+    try:
+        from app.chunkers.summary_generator import summary_generator, ChunkResult as CR2
+        from app.models.chunk import DocumentChunk
+        from sqlalchemy import select, update
+
+        async with AsyncSessionLocal() as db:
+            if not settings.PGBOUNCER_ENABLED:
+                from app.middleware.tenant_middleware import set_tenant_context_for_db
+                await set_tenant_context_for_db(db, tenant_id)
+            result = await db.execute(
+                select(DocumentChunk).where(
+                    DocumentChunk.document_id == doc_id,
+                    DocumentChunk.node_type == "parent",
+                )
+            )
+            parent_db = result.scalars().all()
+
+        if not parent_db:
+            print(f"[Phase 2] 无 PARENT 节点，跳过摘要生成: {doc_id}")
+        else:
+            print(f"[Phase 2] 开始摘要生成: {doc_id}, {len(parent_db)} 个 PARENT")
+            parent_results = []
+            parent_id_of = {}          # id(cr) -> parent 的数据库 UUID
+            for pchunk in parent_db:
+                cr = CR2(
+                    content=pchunk.content,
+                    start=pchunk.chunk_start or 0,
+                    end=pchunk.chunk_end or len(pchunk.content or ""),
+                    tokens=pchunk.token_count or 0,
+                    chunk_index=pchunk.chunk_index,
+                    domain="legal", node_type="parent",
+                )
+                parent_results.append(cr)
+                parent_id_of[id(cr)] = pchunk.id
+
+            # generate_for_all 原地写入 cr.summary
+            await summary_generator.generate_for_all(parent_results)
 
             async with AsyncSessionLocal() as db:
-                result = await db.execute(
-                    select(DocumentChunk).where(
-                        DocumentChunk.id.in_([__import__("uuid").UUID(pid) for pid in parent_chunk_ids])
-                    )
-                )
-                parent_db = result.scalars().all()
-                parent_results = []
-                for pchunk in parent_db:
-                    cr = CR2(
-                        content=pchunk.content,
-                        start=pchunk.chunk_start or 0,
-                        end=pchunk.chunk_end or len(pchunk.content or ""),
-                        tokens=pchunk.token_count or 0,
-                        chunk_index=pchunk.chunk_index,
-                        domain="legal", node_type="parent",
-                    )
-                    parent_results.append(cr)
-
-                await summary_generator.generate_for_all(parent_results)
-
+                if not settings.PGBOUNCER_ENABLED:
+                    from app.middleware.tenant_middleware import set_tenant_context_for_db
+                    await set_tenant_context_for_db(db, tenant_id)
+                written = 0
                 for cr in parent_results:
                     if cr.summary:
+                        # 按对象身份取回真实 UUID（原实现用 parent_chunk_ids[cr.chunk_index]
+                        # 索引一个短列表，必然越界/取错）
                         await db.execute(
                             update(DocumentChunk)
-                            .where(DocumentChunk.id == parent_chunk_ids[cr.chunk_index])
+                            .where(DocumentChunk.id == parent_id_of[id(cr)])
                             .values(summary=cr.summary)
                         )
+                        written += 1
                 await db.commit()
-                print(f"[Phase 2] 摘要生成完成: {doc_id}")
-        except Exception as e:
-            print(f"[Phase 2] 摘要生成失败: {e}")
-            import traceback; traceback.print_exc()
+                print(f"[Phase 2] 摘要生成完成: {doc_id}, 写入 {written}/{len(parent_results)}")
+    except Exception as e:
+        print(f"[Phase 2] 摘要生成失败: {e}")
+        import traceback; traceback.print_exc()
 
     # 标记任务完成
     for jid in job_ids:
