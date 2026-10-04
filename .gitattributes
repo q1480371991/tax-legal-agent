@@ -1,0 +1,4 @@
+# shell 脚本必须用 LF —— Windows 下若被转成 CRLF，Linux 容器里 shebang 会失效
+# （报 "exec /app/docker-entrypoint.sh: no such file or directory"）
+*.sh text eol=lf
+*.bash text eol=lf

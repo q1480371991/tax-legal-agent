@@ -217,3 +217,8 @@ rag_backend/storage/
 rag_backend/uploads/
 !rag_backend/uploads/.gitkeep
 !rag_backend/storage/.gitkeep
+
+# 本地测试文档与中间产物（不入库）
+/test_docs/
+/530_ext.sql
+/prepare_schema.py

@@ -441,29 +441,7 @@ class EnterpriseAgentService:
             logger.warning("[记忆系统] 缺少session_id或user_id，跳过记忆系统")
 
         # 🔗 图谱路径检索（"X和Y有什么关系"类问题）
-        import re as _re
-        graph_path_text = ""
-        entity_pairs = _re.findall(r'([\u4e00-\u9fa5]{2,6})和([\u4e00-\u9fa5]{2,6})', user_input)
-        if entity_pairs:
-            try:
-                from app.knowledge_graph.neo4j_manager import Neo4jManager as _N
-                _n = _N(uri=settings.NEO4J_URI, user=settings.NEO4J_USER, password=settings.NEO4J_PASSWORD)
-                if _n.driver:
-                    _parts = []
-                    for _s, _t in entity_pairs:
-                        _paths = _n.find_path_between(source_name=_s, target_name=_t, tenant_id=tenant_id, max_depth=4)
-                        if _paths:
-                            _parts.append(f"{_s} ↔ {_t}：")
-                            for _i, _p in enumerate(_paths[:3], 1):
-                                _chain = " → ".join(f"{_e['name']}({_e['type']})" for _e in _p.get('entities', []))
-                                _rels = " → ".join(_p.get('relations', []))
-                                _parts.append(f"  路径{_i}: {_chain}" + (f"\n         关系: {_rels}" if _rels else ""))
-                    _n.close()
-                    if _parts:
-                        graph_path_text = "\n".join(_parts)
-                        logger.info(f"[图谱路径] 智能对话注入: {graph_path_text[:60]}...")
-            except Exception as _e:
-                logger.warning(f"[图谱路径] 智能对话检索失败: {_e}")
+        graph_path_text = self._collect_graph_path_text(user_input, tenant_id)
 
         # 🆕 构建增强的用户输入 - 包含RAG上下文 + 图谱路径 + 记忆上下文
         # 注意：使用 XML 格式标记，OutputFormatter 会自动清理
@@ -568,6 +546,38 @@ class EnterpriseAgentService:
             traceback.print_exc()
             return f"抱歉，处理过程中出现错误：{str(e)}"
     
+    def _collect_graph_path_text(self, user_input: str, tenant_id: str) -> str:
+        """图谱路径检索（"X和Y有什么关系"类问题）→ 供 prompt 注入的文本。
+
+        原实现在两处内联重复，抽为方法避免漂移。
+        """
+        import re as _re
+        graph_path_text = ""
+        entity_pairs = _re.findall(r'([一-龥]{2,6})和([一-龥]{2,6})', user_input)
+        if not entity_pairs:
+            return ""
+        try:
+            from app.knowledge_graph.neo4j_manager import Neo4jManager as _N
+            _n = _N(uri=settings.NEO4J_URI, user=settings.NEO4J_USER, password=settings.NEO4J_PASSWORD)
+            if _n.driver:
+                _parts = []
+                for _s, _t in entity_pairs:
+                    _paths = _n.find_path_between(source_name=_s, target_name=_t, tenant_id=tenant_id, max_depth=4)
+                    if _paths:
+                        _parts.append(f"{_s} ↔ {_t}：")
+                        for _i, _p in enumerate(_paths[:3], 1):
+                            _chain = " → ".join(f"{_e['name']}({_e['type']})" for _e in _p.get('entities', []))
+                            _rels = " → ".join(_p.get('relations', []))
+                            _parts.append(f"  路径{_i}: {_chain}" + (f"\n         关系: {_rels}" if _rels else ""))
+                _n.close()
+                if _parts:
+                    graph_path_text = "\n".join(_parts)
+                    logger.info(f"[图谱路径] 智能对话注入: {graph_path_text[:60]}...")
+        except Exception as _e:
+            logger.warning(f"[图谱路径] 智能对话检索失败: {_e}")
+        return graph_path_text
+
+
     async def _chat_stream_custom(
         self,
         user_input: str,
@@ -746,29 +756,7 @@ class EnterpriseAgentService:
             logger.warning("[记忆系统] 缺少session_id或user_id，跳过记忆系统")
         
         # 🔗 图谱路径检索（"X和Y有什么关系"类问题）
-        import re as _re
-        graph_path_text = ""
-        entity_pairs = _re.findall(r'([\u4e00-\u9fa5]{2,6})和([\u4e00-\u9fa5]{2,6})', user_input)
-        if entity_pairs:
-            try:
-                from app.knowledge_graph.neo4j_manager import Neo4jManager as _N
-                _n = _N(uri=settings.NEO4J_URI, user=settings.NEO4J_USER, password=settings.NEO4J_PASSWORD)
-                if _n.driver:
-                    _parts = []
-                    for _s, _t in entity_pairs:
-                        _paths = _n.find_path_between(source_name=_s, target_name=_t, tenant_id=tenant_id, max_depth=4)
-                        if _paths:
-                            _parts.append(f"{_s} ↔ {_t}：")
-                            for _i, _p in enumerate(_paths[:3], 1):
-                                _chain = " → ".join(f"{_e['name']}({_e['type']})" for _e in _p.get('entities', []))
-                                _rels = " → ".join(_p.get('relations', []))
-                                _parts.append(f"  路径{_i}: {_chain}" + (f"\n         关系: {_rels}" if _rels else ""))
-                    _n.close()
-                    if _parts:
-                        graph_path_text = "\n".join(_parts)
-                        logger.info(f"[图谱路径] 智能对话注入: {graph_path_text[:60]}...")
-            except Exception as _e:
-                logger.warning(f"[图谱路径] 智能对话检索失败: {_e}")
+        graph_path_text = self._collect_graph_path_text(user_input, tenant_id)
 
         # 🆕 构建增强的用户输入 - 包含RAG上下文 + 图谱路径 + 记忆上下文
         # 注意：使用 XML 格式标记，OutputFormatter 会自动清理
