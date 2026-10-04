@@ -104,6 +104,36 @@ class UnifiedRetriever:
             jsonb_array_filter=jsonb_array_filter,
         )
 
+        # ── Step 3.5: 软过滤回退 ──
+        # 查询解析出的过滤条件（year/quarter/tax_type/region）是启发式推断的，
+        # 而 chunk 的 meta_info 未必有这些字段（如 quarter 全库为 0、year 仅约一半）。
+        # 严格 AND 过滤会因某个字段缺失而把结果清空（实测"比亚迪…开发支出"
+        # 解析出 year=2026&quarter=Q1 → 命中 0 条）。
+        # 对策：带过滤为空时，逐步放宽（先去掉最不可靠的字段，最终不带过滤重试）。
+        if not candidates and (metadata_filter or jsonb_array_filter):
+            relaxed = dict(metadata_filter or {})
+            # 按可靠性从低到高移除：quarter/region 最不可靠，year 次之
+            for weak in ("quarter", "region", "tax_type", "year"):
+                relaxed.pop(weak, None)
+                candidates = await hybrid_search_engine.search(
+                    query=query, tenant_id=tenant_id, domain=domain,
+                    metadata_filter=relaxed or None,
+                    jsonb_array_filter=jsonb_array_filter,
+                )
+                if candidates:
+                    logger.info(
+                        f"[软过滤] 严格过滤命中 0，放宽到 {relaxed or '无过滤'} 后命中 {len(candidates)} 条"
+                    )
+                    break
+            if not candidates and jsonb_array_filter:
+                # 最后连指标过滤也去掉（它同样可能过严）
+                candidates = await hybrid_search_engine.search(
+                    query=query, tenant_id=tenant_id, domain=domain,
+                    metadata_filter=None, jsonb_array_filter=None,
+                )
+                if candidates:
+                    logger.info(f"[软过滤] 连指标过滤也放宽，命中 {len(candidates)} 条")
+
         # ── Step 4: 级联图谱扩展（在 rerank 之前，让图谱 chunk 也参与精排）──
         # 顺序很重要：原实现在 rerank 之后才做图谱，导致图谱 chunk 是"硬塞在末尾"、
         # 且不参与 RRF 排序。这里提前到 rerank 前，与第一阶段结果做三源 RRF。
