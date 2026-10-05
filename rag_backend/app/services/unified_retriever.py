@@ -378,7 +378,38 @@ class UnifiedRetriever:
             e["graph_rank"] = gr
             e["from_graph"] = True
 
+        # ── 图谱保底配额（必须在 top_k 截断【之前】决定）──
+        # 问题：图谱路权重天然低（它是「关联补充」而非「精确命中」），
+        # 三源 RRF 后图谱 chunk 会全部沉底，若先截断 top_k 再保底，
+        # 图谱 chunk 早已被截掉（实测「融合后 50 条，图谱剩 0」）—— 级联白做。
+        # 对策：先按 graph_rank（跳数）选出要保底的图谱 chunk，
+        # 把它们并入截断结果，再整体截断。
+        # 配额保守（≤2 条），避免图谱噪音挤掉精确命中。
+        graph_ids = [cid for cid in scores if info.get(cid, {}).get("from_graph")]
+        graph_ids.sort(key=lambda cid: info[cid].get("graph_rank") or 99)
+        graph_quota = min(2, max(1, len(graph_ids) // 3)) if graph_ids else 0
+        guaranteed = graph_ids[:graph_quota]
+
+        # 常规排名截断到 top_k，再确保保底项在其中
         ordered = sorted(scores, key=scores.get, reverse=True)[:top_k]
+        if guaranteed:
+            oset = set(ordered)
+            # 保底项插到第 2 位之后（不喧宾夺主，但保证进入下游可见范围）
+            insert_at = min(2, len(ordered))
+            for gid in reversed(guaranteed):
+                if gid not in oset:
+                    ordered.insert(insert_at, gid)
+                    oset.add(gid)
+            # 保底可能导致超出 top_k，从末尾裁掉非保底项
+            if len(ordered) > top_k:
+                gset = set(guaranteed)
+                trimmed = []
+                for cid in ordered:
+                    if len(trimmed) >= top_k and cid not in gset:
+                        continue
+                    trimmed.append(cid)
+                ordered = trimmed[:max(top_k, len(gset))]
+
         fused: List[Dict] = []
         for cid in ordered:
             e = info[cid]
@@ -393,21 +424,6 @@ class UnifiedRetriever:
                     chunk[key] = e[key]
             fused.append(chunk)
 
-        # ── 图谱保底配额 ──
-        # 问题：图谱路权重天然低（它是「关联补充」而非「精确命中」），
-        # 三源 RRF 后图谱 chunk 会全部沉底，必然被下游 top_k 截掉 —— 级联就白做了。
-        # 对策：在融合结果里为图谱 chunk 预留一个配额位（插到前段），
-        # 保证「图谱确实补充了内容」这一设计意图不被排序淹没。
-        # 配额保守（≤新增数的 1/3 且 ≤2），避免图谱噪音挤掉精确命中。
-        graph_items = [c for c in fused if c.get("from_graph")]
-        if graph_items:
-            quota = min(2, max(1, len(graph_items) // 3))
-            graph_items.sort(key=lambda c: (c.get("graph_rank") or 99))
-            keep = graph_items[:quota]
-            rest = [c for c in fused if not (c.get("from_graph") and c in keep)]
-            # 插到第 2 位之后（不喧宾夺主，但保证进入下游可见范围）
-            insert_at = min(2, len(rest))
-            fused = rest[:insert_at] + keep + rest[insert_at:]
         return fused
 
 

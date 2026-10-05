@@ -55,7 +55,7 @@ class RetrievalPlanner:
 
         # 首轮检索：直接使用原始查询
         if iteration == 0:
-            plan = self._plan_first_retrieval(query, state)
+            plan = await self._plan_first_retrieval(query, state)
         else:
             # 后续检索：基于评估结果规划
             evaluation = state.get("evaluation")
@@ -72,30 +72,39 @@ class RetrievalPlanner:
 
         return state
 
-    def _plan_first_retrieval(
+    async def _plan_first_retrieval(
         self,
         query: str,
         state: AgenticRAGState
     ) -> Dict[str, Any]:
         """
-        规划首次检索
+        规划首次检索。
 
-        Args:
-            query: 用户查询
-            state: 当前状态
-
-        Returns:
-            检索计划
+        action 语义（决定是否叠加图谱，见 agent_service 的消费）：
+          vector_search  → 不叠加图谱（事实型查询，图谱收益低、还引入噪音）
+          hybrid_search  → 叠加图谱（关系/复杂查询，图谱补实体关联）
+          graph_traverse → 强制走图谱（多轮时覆盖率不足的升级动作）
         """
-        # 简单策略：根据查询复杂度选择检索方式
-        complexity = self._classify_query_complexity(query)
+        # 判据优先复用 graph_query_classifier —— 它内部是「图谱/RAG 强模式正则 →
+        # 缓存 → 轻量 LLM → 关键词回退」的完整链路，比单一关键词表准得多。
+        # 失败时回退到本类的关键词规则（_classify_query_complexity）。
+        wants_graph = None
+        try:
+            from app.services.graph_query_classifier import graph_query_classifier
+            _, need_graph = await graph_query_classifier.classify(query)
+            wants_graph = bool(need_graph)
+            logger.debug(
+                f"[RetrievalPlanner] classifier 判定 need_graph={wants_graph}: {query[:40]}"
+            )
+        except Exception as e:
+            logger.warning(f"[RetrievalPlanner] classifier 不可用，回退关键词规则: {e}")
 
-        if complexity == "simple":
-            action = "vector_search"
-        elif complexity == "complex":
-            action = "hybrid_search"  # 向量 + 图谱
-        else:
-            action = "multi_step_search"  # 多步检索
+        if wants_graph is None:
+            # 兜底：关键词复杂度规则
+            complexity = self._classify_query_complexity(query)
+            wants_graph = complexity != "simple"
+
+        action = "hybrid_search" if wants_graph else "vector_search"
 
         return {
             "action": action,
@@ -246,8 +255,20 @@ class RetrievalPlanner:
         """
         query_lower = query.lower()
 
-        # 多跳推理关键词
-        multi_hop_keywords = ["为什么", "如何", "关系", "比较", "区别", "影响", "原因"]
+        # 多跳推理关键词 —— 这类问题需要沿实体关系链推理，图谱是强项。
+        # 补充了"实体关系"类词汇（子公司/母公司/股东/关联/合作/签约等），
+        # 否则「万科的子公司有哪些」会被判 simple 而错过图谱。
+        multi_hop_keywords = [
+            "为什么", "如何", "关系", "比较", "区别", "影响", "原因",
+            # 实体关系类（图谱多跳的典型场景）
+            "子公司", "母公司", "股东", "控股", "关联", "合作", "签约",
+            "供应商", "客户", "上下游", "法人", "实控人", "关联方",
+            "股权", "持股", "投资", "并购", "收购", "增持", "减持",
+            # 动作类（协议/合同/签署等，动词与名词形式都要覆盖）
+            "签署", "签订", "签了", "合同", "协议", "担保", "承诺",
+            # 归属/构成类
+            "属于", "旗下", "控股", "参股", "控股股东", "实际控制",
+        ]
         if any(kw in query_lower for kw in multi_hop_keywords):
             return "multi_hop"
 

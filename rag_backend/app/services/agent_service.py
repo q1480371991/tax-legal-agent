@@ -1000,6 +1000,22 @@ class EnterpriseAgentService:
             if "需要更多相关信息" in cur_q or "没有找到相关信息" in cur_q:
                 cur_q = query
 
+            # ── action → enable_graph：让 Planner 自主决定本轮是否叠加图谱 ──
+            # A 方案：仅 agentic 模式生效（simple/graphrag 由用户显式指定，不走这里）。
+            # 映射规则：
+            #   vector_search  → 不叠加图谱（简单事实型查询，图谱收益低、还引入噪音）
+            #   hybrid_search  → 叠加图谱（复杂/多跳查询，图谱补实体关联）
+            #   graph_traverse → 强制叠加（覆盖率不足时 Planner 产出的升级动作）
+            # 注意：enable_graph 是【调用方传入的能力上限】—— 用户显式关闭图谱时
+            # （enable_graph=False），agent 不应擅自开启，故取「与」。
+            _action_wants_graph = action in ("hybrid_search", "graph_traverse")
+            _round_enable_graph = bool(enable_graph) and _action_wants_graph
+            if _round_enable_graph != enable_graph:
+                logger.info(
+                    f"[Agentic] 第 {_round} 轮：action={action} → "
+                    f"本轮{'叠加' if _round_enable_graph else '不使用'}图谱"
+                )
+
             iteration = state.get("iteration_count", 0)
             t0 = _time.time()
             try:
@@ -1010,7 +1026,7 @@ class EnterpriseAgentService:
                     user_id=user_id,
                     top_k=top_k,
                     enable_routing=False,   # agentic 自己控制流程，强制走 KB 检索
-                    enable_graph=enable_graph,
+                    enable_graph=_round_enable_graph,
                     enable_rerank=enable_rerank,
                     tenant_id=tenant_id,
                 )
@@ -1046,13 +1062,15 @@ class EnterpriseAgentService:
                     seen.add(key)
             state["all_results"] = all_results
 
-            # 前端轨迹
+            # 前端轨迹（带上本轮图谱决策，便于展示 agent 的调度过程）
             history_payload.append({
                 "step_number": iteration + 1,
                 "action": action,
                 "query": cur_q,
                 "result_count": len(round_results),
                 "duration_ms": dt_ms,
+                "enable_graph": _round_enable_graph,
+                "graph_chunks": sum(1 for c in round_results if c.get("from_graph")),
             })
 
             # 进度：检索完成，开始评估

@@ -186,8 +186,18 @@ class GraphQueryClassifier:
         query = query.strip()
 
         try:
-            # 所有模式通用: RAG强模式优先检查（快速跳过不需要图谱的查询）
-            # 放在最前面可以避免不必要的LLM调用
+            # GRAPH 强模式【优先于】RAG 强模式。
+            # 原实现先查 RAG 强模式并直接返回 False，导致
+            # 「大湖股份和业绩补偿方是什么关系」同时命中 '是什么'(RAG) 与 '关系'(GRAPH)
+            # 时，被 '是什么' 抢先否掉 —— 但"关系"显然是更强的图谱信号。
+            # 顺序调整后：命中图谱强模式即判需要图谱，不再往下走。
+            if self._matches_graph_strong_patterns(query):
+                logger.info(
+                    f"[GraphQueryClassifier] 图谱强模式匹配，使用图谱: {query[:30]}..."
+                )
+                return GraphQueryType.ENTITY_RELATION, True
+
+            # RAG强模式次之（快速跳过不需要图谱的查询，避免不必要的 LLM 调用）
             if self._matches_rag_strong_patterns(query):
                 logger.debug(
                     f"[GraphQueryClassifier] RAG强模式匹配，跳过图谱: {query[:30]}..."
