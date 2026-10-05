@@ -12,7 +12,6 @@ from app.langgraph.agentic_rag_state import (
 )
 from app.langgraph.agentic_rag_nodes import (
     RetrievalPlanner,
-    RetrievalExecutor,
     ResultEvaluator,
     ContextAggregator
 )
@@ -153,93 +152,6 @@ async def test_retrieval_planner_refine_query():
 
     # 应该包含缺失方面
     assert "税率" in refined or "优惠政策" in refined
-
-
-# ==================== RetrievalExecutor 测试 ====================
-
-@pytest.mark.asyncio
-async def test_retrieval_executor_vector_search(basic_state, mock_vector_search):
-    """测试向量检索执行"""
-    executor = RetrievalExecutor(vector_search_service=mock_vector_search)
-
-    basic_state["next_action"] = "vector_search"
-    basic_state["current_query"] = "测试查询"
-
-    state = await executor.execute(basic_state)
-
-    # 验证检索结果
-    assert len(state["current_results"]) > 0
-    assert len(state["all_results"]) > 0
-    assert state["iteration_count"] == 1
-    assert len(state["retrieval_history"]) == 1
-
-    # 验证检索步骤记录
-    step = state["retrieval_history"][0]
-    assert step.action == "vector_search"
-    assert step.result_count > 0
-
-
-@pytest.mark.asyncio
-async def test_retrieval_executor_hybrid_search(basic_state, mock_graph_search):
-    """测试混合检索执行"""
-    executor = RetrievalExecutor(graph_search_service=mock_graph_search)
-
-    basic_state["next_action"] = "hybrid_search"
-    basic_state["current_query"] = "测试查询"
-
-    state = await executor.execute(basic_state)
-
-    # 验证调用了图谱检索
-    mock_graph_search.hybrid_retrieve.assert_called_once()
-    assert len(state["current_results"]) > 0
-
-
-@pytest.mark.asyncio
-async def test_retrieval_executor_unknown_action(basic_state):
-    """测试未知动作处理"""
-    executor = RetrievalExecutor()
-
-    basic_state["next_action"] = "unknown_action"
-    basic_state["current_query"] = "测试查询"
-
-    state = await executor.execute(basic_state)
-
-    # 应该返回空结果
-    assert state["current_results"] == []
-
-
-@pytest.mark.asyncio
-async def test_retrieval_executor_accumulates_results(basic_state, mock_vector_search):
-    """测试结果累积"""
-    executor = RetrievalExecutor(vector_search_service=mock_vector_search)
-
-    basic_state["next_action"] = "vector_search"
-    basic_state["current_query"] = "测试查询"
-
-    # 第一轮检索
-    state = await executor.execute(basic_state)
-    first_count = len(state["all_results"])
-
-    # 第二轮检索
-    state["next_action"] = "vector_search"
-    state = await executor.execute(state)
-
-    # 结果应该累积（去重）
-    assert len(state["all_results"]) >= first_count
-
-
-@pytest.mark.asyncio
-async def test_retrieval_executor_tracks_time(basic_state, mock_vector_search):
-    """测试检索时间追踪"""
-    executor = RetrievalExecutor(vector_search_service=mock_vector_search)
-
-    basic_state["next_action"] = "vector_search"
-    basic_state["current_query"] = "测试查询"
-
-    state = await executor.execute(basic_state)
-
-    # 应该记录检索时间
-    assert state["total_retrieval_time"] > 0
 
 
 # ==================== ResultEvaluator 测试 ====================
@@ -481,17 +393,27 @@ async def test_agentic_rag_full_workflow(
     mock_vector_search,
     mock_llm_service
 ):
-    """测试完整的 Agentic RAG 工作流"""
+    """测试完整的 Agentic RAG 工作流
+
+    注：原实现用 RetrievalExecutor 执行检索，但该类从未被真实链路使用（死代码），
+    已删除。真实链路（agent_service._agentic_retrieve）由自身直接调用 retriever
+    完成检索，测试中以 mock 检索结果模拟这一步。
+    """
     planner = RetrievalPlanner()
-    executor = RetrievalExecutor(vector_search_service=mock_vector_search)
     evaluator = ResultEvaluator(llm_service=mock_llm_service)
     aggregator = ContextAggregator()
 
     state = basic_state
 
-    # 第一轮迭代
+    # 第一轮迭代：规划 → 检索（mock）→ 评估
     state = await planner.plan(state)
-    state = await executor.execute(state)
+    results = await mock_vector_search.search(query=state["current_query"], kb_id=state["kb_id"], top_k=10)
+    state["current_results"] = results
+    state["iteration_count"] = 1
+    state["retrieval_history"] = [RetrievalStep(
+        step_number=1, action=state["next_action"], query=state["current_query"],
+        parameters={}, results=results, result_count=len(results), timestamp=datetime.now(),
+    )]
     state = await evaluator.evaluate(state)
 
     # 验证第一轮结果
@@ -502,7 +424,9 @@ async def test_agentic_rag_full_workflow(
     # 如果需要继续，执行第二轮
     if state["should_continue"]:
         state = await planner.plan(state)
-        state = await executor.execute(state)
+        results = await mock_vector_search.search(query=state["current_query"], kb_id=state["kb_id"], top_k=10)
+        state["current_results"] = results
+        state["iteration_count"] = 2
         state = await evaluator.evaluate(state)
 
         assert state["iteration_count"] == 2

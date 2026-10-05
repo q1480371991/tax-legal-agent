@@ -17,6 +17,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 from app.core.config import settings
+from app.knowledge_graph.entity_dedup import entity_dedup
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +87,16 @@ class KGIngestBridge:
             # 实体名 → 出现它的 chunk_id 列表（跨库桥接）
             name_to_chunks: Dict[str, List[str]] = extracted["name_to_chunks"]
 
-            created_e = manager.batch_create_entities(
-                extracted["entities"], tenant_id
-            )
-            created_r = manager.batch_create_relations(
-                extracted["relations"], tenant_id
-            )
+            # ── 实体消解：把同一实体的多种写法归并成一个规范名 ──
+            # 如「南京中科水治理有限公司（联合体牵头人）」与「南京中科水治理股份有限公司」
+            # 应成为同一个节点，否则图谱关系被割裂。
+            entities, alias_map = entity_dedup.resolve(extracted["entities"])
+            relations = self._rewrite_relations(extracted["relations"], alias_map)
+            # chunk 关联也按规范名归并（否则别名下的 chunk 关联会丢）
+            name_to_chunks = self._remap_name_to_chunks(name_to_chunks, alias_map)
+
+            created_e = manager.batch_create_entities(entities, tenant_id)
+            created_r = manager.batch_create_relations(relations, tenant_id)
 
             # 把 chunk_ids 回写到实体节点属性上
             await self._attach_chunk_ids(manager, name_to_chunks, tenant_id)
@@ -99,6 +104,7 @@ class KGIngestBridge:
             logger.info(
                 f"[KGIngest] 文档 {document_id} 图谱构建完成: "
                 f"实体 {created_e}, 关系 {created_r}"
+                + (f"（消解 {len(alias_map)} 个别名）" if alias_map else "")
             )
             return {"entities": created_e, "relations": created_r}
 
@@ -174,6 +180,44 @@ class KGIngestBridge:
     def _relation_extractor(self):
         from app.knowledge_graph.relation_extractor import relation_extractor
         return relation_extractor
+
+    @staticmethod
+    def _rewrite_relations(relations: List[Dict], alias_map: Dict[str, str]) -> List[Dict]:
+        """按消解结果把关系两端的别名替换为规范名。
+
+        否则实体合并后，关系仍指向旧名，会在图里形成悬空引用。
+        """
+        if not alias_map or not relations:
+            return relations
+        out = []
+        seen = set()
+        for rel in relations:
+            src = alias_map.get(rel.get("source", ""), rel.get("source", ""))
+            tgt = alias_map.get(rel.get("target", ""), rel.get("target", ""))
+            if not src or not tgt or src == tgt:
+                continue
+            r = dict(rel)
+            r["source"], r["target"] = src, tgt
+            key = f"{src}|{r.get('type')}|{tgt}"
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+        return out
+
+    @staticmethod
+    def _remap_name_to_chunks(name_to_chunks: Dict[str, List[str]],
+                              alias_map: Dict[str, str]) -> Dict[str, List[str]]:
+        """把「实体名 → chunk_ids」的 map 按消解结果归并到规范名。"""
+        if not alias_map:
+            return name_to_chunks
+        out: Dict[str, List[str]] = {}
+        for name, cids in name_to_chunks.items():
+            canon = alias_map.get(name, name)
+            bucket = out.setdefault(canon, [])
+            for cid in cids:
+                if cid not in bucket:
+                    bucket.append(cid)
+        return out
 
     async def _attach_chunk_ids(self, manager, name_to_chunks: Dict[str, List[str]], tenant_id: str) -> None:
         """把 chunk_ids 写回实体的属性，建立「实体 ↔ 文档块」跨库桥接。"""

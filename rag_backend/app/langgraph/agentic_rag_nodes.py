@@ -2,10 +2,13 @@
 Agentic RAG 节点实现
 
 实现自主检索 Agent 的核心节点：
-1. RetrievalPlanner - 规划检索策略
-2. RetrievalExecutor - 执行检索
-3. ResultEvaluator - 评估结果质量
-4. ContextAggregator - 聚合上下文
+1. RetrievalPlanner - 规划检索策略（决定 action，进而决定是否叠加图谱）
+2. ResultEvaluator - 评估结果质量
+3. ContextAggregator - 聚合上下文
+
+注：原有的 RetrievalExecutor（执行检索）节点已删除 —— 它的"执行"职责实际由
+agent_service._agentic_retrieve 直接调用 unified_retriever 完成，
+该节点从未被实例化（死代码），且内部 _graph_traverse 是空壳。
 """
 
 import logging
@@ -278,140 +281,6 @@ class RetrievalPlanner:
             return "complex"
 
         return "simple"
-
-
-class RetrievalExecutor:
-    """
-    检索执行节点
-
-    根据规划执行具体的检索操作。
-    """
-
-    def __init__(
-        self,
-        vector_search_service=None,
-        graph_search_service=None
-    ):
-        """
-        初始化执行器
-
-        Args:
-            vector_search_service: 向量检索服务
-            graph_search_service: 图谱检索服务
-        """
-        self.vector_search = vector_search_service
-        self.graph_search = graph_search_service
-
-    async def execute(self, state: AgenticRAGState) -> AgenticRAGState:
-        """
-        执行检索
-
-        Args:
-            state: 当前状态
-
-        Returns:
-            更新后的状态
-        """
-        action = state.get("next_action", "vector_search")
-        query = state["current_query"]
-        kb_id = state["kb_id"]
-        iteration = state.get("iteration_count", 0)
-
-        logger.info(f"[RetrievalExecutor] 执行检索: action={action}, iteration={iteration}")
-
-        start_time = time.time()
-
-        # 根据动作类型执行检索
-        if action == "vector_search":
-            results = await self._vector_search(query, kb_id)
-        elif action == "hybrid_search":
-            results = await self._hybrid_search(query, kb_id)
-        elif action == "graph_traverse":
-            results = await self._graph_traverse(query, kb_id)
-        else:
-            logger.warning(f"[RetrievalExecutor] 未知动作: {action}")
-            results = []
-
-        duration = time.time() - start_time
-
-        # 记录检索步骤
-        step = RetrievalStep(
-            step_number=iteration + 1,
-            action=action,
-            query=query,
-            parameters={},
-            results=results,
-            result_count=len(results),
-            timestamp=datetime.now()
-        )
-
-        retrieval_history = state.get("retrieval_history", [])
-        retrieval_history.append(step)
-
-        # 更新状态
-        state["retrieval_history"] = retrieval_history
-        state["current_results"] = results
-        state["iteration_count"] = iteration + 1
-
-        # 累积结果（去重）
-        all_results = state.get("all_results", [])
-        existing_ids = {r.get("id") for r in all_results if "id" in r}
-
-        for result in results:
-            result_id = result.get("id")
-            if result_id and result_id not in existing_ids:
-                all_results.append(result)
-                existing_ids.add(result_id)
-            elif not result_id:
-                all_results.append(result)
-
-        state["all_results"] = all_results
-
-        # 更新总检索时间
-        total_time = state.get("total_retrieval_time", 0.0)
-        state["total_retrieval_time"] = total_time + duration
-
-        logger.debug(f"[RetrievalExecutor] 检索完成: {len(results)} 个结果，耗时 {duration:.2f}s")
-
-        return state
-
-    async def _vector_search(self, query: str, kb_id: str) -> List[Dict[str, Any]]:
-        """向量检索"""
-        if not self.vector_search:
-            return []
-
-        try:
-            results = await self.vector_search.search(
-                query=query,
-                kb_id=kb_id,
-                top_k=10
-            )
-            return results
-        except Exception as e:
-            logger.error(f"[RetrievalExecutor] 向量检索失败: {e}")
-            return []
-
-    async def _hybrid_search(self, query: str, kb_id: str) -> List[Dict[str, Any]]:
-        """混合检索"""
-        if not self.graph_search:
-            return await self._vector_search(query, kb_id)
-
-        try:
-            result = await self.graph_search.hybrid_retrieve(
-                query=query,
-                kb_id=kb_id,
-                top_k=10
-            )
-            return result.vector_chunks
-        except Exception as e:
-            logger.error(f"[RetrievalExecutor] 混合检索失败: {e}")
-            return []
-
-    async def _graph_traverse(self, query: str, kb_id: str) -> List[Dict[str, Any]]:
-        """图谱遍历"""
-        # 简化实现：返回空列表
-        logger.info("[RetrievalExecutor] 图谱遍历功能待实现")
-        return []
 
 
 class ResultEvaluator:
