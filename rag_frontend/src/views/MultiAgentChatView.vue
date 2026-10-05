@@ -30,6 +30,7 @@ import {
   Lightbulb,
   AlertCircle,
   History
+  Activity,
 } from 'lucide-vue-next'
 
 import { marked } from 'marked'
@@ -158,6 +159,20 @@ const currentStage = ref<string | null>(null)
 const intentAnalysis = ref<{ category: string; confidence: number; strategy: string } | null>(null)
 
 const activeSpecialists = ref<string[]>([])
+
+// 流程可视化面板的显示控制（渐进式披露）：
+//   简单问题（单专家）→ 默认收起，避免用 5 阶段流程干扰用户
+//   复杂问题（多专家）→ 默认展开，让用户看到协作过程
+// 用户可手动切换，切换后本轮不再被自动覆盖。
+const FLOW_PANEL_KEY = 'multi_agent_flow_panel_open'
+const showFlowPanel = ref<boolean>(localStorage.getItem(FLOW_PANEL_KEY) !== '0')
+const flowPanelManuallyToggled = ref(false)
+
+function toggleFlowPanel() {
+  showFlowPanel.value = !showFlowPanel.value
+  flowPanelManuallyToggled.value = true
+  localStorage.setItem(FLOW_PANEL_KEY, showFlowPanel.value ? '1' : '0')
+}
 
 const reflectionResult = ref<string | null>(null)
 const processingTime = ref<number | null>(null)
@@ -884,6 +899,16 @@ watch([messages, currentStage, intentAnalysis, activeSpecialists, reflectionResu
   saveState()
 
 }, { deep: true })
+
+// 渐进式披露：检测到【多专家协作】时自动展开流程面板，让用户看到协作过程；
+// 单专家（简单问题）则不展开，避免用 5 阶段流程干扰。
+// 用户手动切换过后（flowPanelManuallyToggled），本轮不再自动覆盖其选择。
+watch(activeSpecialists, (specs) => {
+  if (flowPanelManuallyToggled.value) return
+  if (Array.isArray(specs) && specs.length >= 2 && !showFlowPanel.value) {
+    showFlowPanel.value = true
+  }
+})
 
 
 
@@ -1789,6 +1814,22 @@ function renderMessageBody(content: string, index: number): string {
 
             <button
 
+              @click="toggleFlowPanel"
+
+              :title="showFlowPanel ? '收起流程面板' : '展开流程面板'"
+
+              class="p-2 rounded-lg transition-colors"
+
+              :class="showFlowPanel ? 'text-cyan-600 bg-cyan-50' : 'text-gray-500 hover:text-gray-900 hover:bg-gray-100'"
+
+            >
+
+              <Activity :size="18" />
+
+            </button>
+
+            <button
+
               @click="showSettings = !showSettings"
 
               class="p-2 text-gray-500 hover:text-gray-900 hover:bg-gray-100 rounded-lg transition-colors"
@@ -2103,7 +2144,8 @@ function renderMessageBody(content: string, index: number): string {
 
 
 
-      <div class="flex-1 overflow-y-auto p-3">
+      <!-- 流程可视化栏（时序面板）—— 渐进式披露：单专家简单问题时可收起 -->
+      <div v-show="showFlowPanel" class="flex-1 overflow-y-auto p-3">
         <div class="relative min-h-full flex flex-col justify-between pb-2">
           <div class="absolute left-[13.5px] top-4 bottom-8 w-[3px] bg-gray-100 rounded-full overflow-hidden">
             <div v-if="isLoading" class="w-full h-1/2 bg-gradient-to-b from-transparent via-cyan-400 to-transparent animate-pulse shadow-[0_0_8px_rgba(6,182,212,0.6)]" style="animation-duration: 1.2s;"></div>
