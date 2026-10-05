@@ -143,7 +143,35 @@ class RetrievalPlanner:
                 "parameters": {"top_k": 10}
             }
 
-        # LLM 智能改写（注入了 llm_service 时优先），失败/为空则回退规则改写
+        # 判断本轮该"改写重试"还是"换检索方式升级"
+        # 参考系：历史里是否已试过图谱这一路
+        tried_graph = any(
+            getattr(step, "action", None) == "graph_traverse" for step in history
+        )
+        # 改写重试的次数：历史里做过几轮 vector_search/hybrid_search
+        rewrite_rounds = sum(
+            1 for step in history
+            if getattr(step, "action", None) in ("vector_search", "hybrid_search")
+        )
+
+        # 升级优先：已改写 ≥1 轮仍是低覆盖 → 说明"换问法"没用，该换检索方式了。
+        # （原实现只在 missing_aspects 为空 + coverage<0.5 时才升级，
+        #   而 LLM 评估几乎总会给出 missing_aspects，导致升级分支实际不可达。）
+        if (evaluation.coverage_score < 0.5 and not tried_graph
+                and rewrite_rounds >= 1):
+            logger.info(
+                f"[RetrievalPlanner] 已改写 {rewrite_rounds} 轮仍低覆盖"
+                f"(coverage={evaluation.coverage_score:.2f})，升级为图谱检索"
+            )
+            return {
+                "action": "graph_traverse",
+                "query": original_query,
+                "parameters": {"depth": 2},
+            }
+
+        # 其次：针对缺失方面改写查询，再检索一轮
+        # 优先用 LLM 改写（能理解语义），失败/无差异则回退规则改写。
+        missing_aspects = evaluation.missing_aspects
         if self.llm_service is not None:
             try:
                 refined = await self._llm_rewrite_query(
@@ -158,31 +186,23 @@ class RetrievalPlanner:
             except Exception as e:
                 logger.warning(f"[RetrievalPlanner] LLM 查询改写失败，回退规则: {e}")
 
-        # 分析缺失方面
-        missing_aspects = evaluation.missing_aspects
-
         if missing_aspects:
-            # 生成针对缺失方面的查询
             refined_query = self._refine_query_for_missing(
-                original_query,
-                missing_aspects
+                original_query, missing_aspects
             )
-
             return {
                 "action": "vector_search",
                 "query": refined_query,
-                "parameters": {"top_k": 5}
+                "parameters": {"top_k": 5},
             }
 
-        # 如果覆盖度低，尝试不同的检索方式
-        if evaluation.coverage_score < 0.5:
-            # 尝试图谱检索
-            if not any(step.action == "graph_traverse" for step in history):
-                return {
-                    "action": "graph_traverse",
-                    "query": original_query,
-                    "parameters": {"depth": 2}
-                }
+        # 兜底：仍尝试图谱（若尚未试过）
+        if evaluation.coverage_score < 0.5 and not tried_graph:
+            return {
+                "action": "graph_traverse",
+                "query": original_query,
+                "parameters": {"depth": 2},
+            }
 
         # 默认：使用改写后的查询重新检索
         return {
@@ -338,12 +358,27 @@ class ResultEvaluator:
             iteration < max_iterations
         )
 
-        # 🔌 前置短路：本轮整体分极低（知识库基本无相关内容，如通用知识类问题），
-        # 继续改写/检索也无意义，提前停止，避免白跑后续轮次的 检索+rerank+评估 LLM。
+        # 🔌 前置短路：本轮整体分极低，提前停止，避免白跑后续轮次的 检索+rerank+评估 LLM。
+        #
+        # ⚠️ 短路的判据不能只看分数 —— 「检索方式不对」（应换方式重试）与
+        # 「知识库压根无此内容」（可停止）在分数上无法区分，两者都是 overall 极低。
+        # 原实现只看分数，导致「第一轮不够 → 第二轮升级走图谱」这条链永不可达：
+        # 越是检索不到，越会被提前掐掉，恰好扼杀了 agentic 最该做的事（换招重试）。
+        #
+        # 改进：仅当【已无其它检索方式可尝试】时才短路。
+        # 判据用一个保守的代理指标 —— 历史里是否已试过图谱这一路：
+        #   · 还没试过图谱 → 保留 continue，让下一轮升级（Planner 会产出 graph_traverse）
+        #   · 已试过图谱且仍是极低分 → 说明真的没内容，短路止损
+        # 这样既保留短路的保护作用，又不扼杀"换检索方式"的重试。
         short_circuited = False
         if should_continue and evaluation.overall_score < self.min_useful_score:
-            should_continue = False
-            short_circuited = True
+            history = state.get("retrieval_history") or []
+            tried_graph = any(
+                getattr(step, "action", None) == "graph_traverse" for step in history
+            )
+            if tried_graph:
+                should_continue = False
+                short_circuited = True
 
         state["should_continue"] = should_continue
 
