@@ -154,24 +154,34 @@ class ClarificationService:
         routing_strategy: str
     ) -> Optional[ClarificationRequest]:
         """检查输入清晰度并返回追问请求
-        
-        追问逻辑调整：
-        - 只有在输入过短或置信度低于阈值时才追问
-        - 实体缺失不触发追问（专家节点可以处理）
-        - 意图模糊时追问
+
+        追问判据（已修正）：
+          1. 输入过短 → 追问（信息确实不足）
+          2. 意图确实不明（unknown）→ 追问
+          3. complex_task → 不追问
+
+        ⚠️ 已移除「置信度低 → 追问」这条判据（原第 169-170 行），原因：
+          · 「分类置信度低」≠「需要用户澄清」。前者是【分类器没把握】
+            （问题通用、无强领域词），后者才是【缺执行所需信息】。
+          · 规则层兜底固定给 0.5，低于澄清阈值 0.6 → 导致任何"未明确分类"
+            的问题（如「比亚迪…报告中的开发支出是多少」）都被反问，而这类
+            问题直接检索即可，追问只损害体验。
+          · 更矛盾的是：此时 routing_strategy 往往已是 rag_retrieval（已决定
+            去检索），却还要反问用户 —— 逻辑上不自洽。
+          低置信度的体验问题改由【多答案+推荐】处理（见回答生成侧），
+          而不是打断用户。
         """
         if self._is_actionable_policy_query(query):
             return None
-        
+
         if len(query) < self.min_query_length:
             return self._handle_short_input(query)
-        
-        if confidence < self.confidence_threshold:
-            return self._handle_low_confidence(query, intent, confidence)
-        
-        if intent == "unknown" or intent == "complex_task":
+
+        # 注：不再因 confidence 低而追问（原因见 docstring）
+        # complex_task 表示"任务复杂"（该派多专家），不是"用户没说清"，故也不追问
+        if intent == "unknown":
             return self._handle_ambiguous_intent(query)
-        
+
         return None
     
     def _handle_short_input(self, query: str) -> ClarificationRequest:
@@ -425,17 +435,13 @@ class ClarificationService:
         Returns:
             True 如果需要追问
         """
+        # 判据同 _check_input_clarity（保持一致）：
+        # 只看"信息是否确实不足"，不看"分类置信度高低"。
+        # confidence 参数保留以兼容调用方，但不再作为追问依据。
         if len(query.strip()) < self.min_query_length:
             return True
-        
-        if confidence < self.confidence_threshold:
+
+        if intent == "unknown":
             return True
-        
-        if intent in ["unknown", "complex_task"]:
-            return True
-        
-        missing = self._check_critical_entities(intent, entities)
-        if len(missing) > 0:
-            return True
-        
+
         return False
