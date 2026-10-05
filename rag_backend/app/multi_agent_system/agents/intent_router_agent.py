@@ -765,16 +765,44 @@ class IntentRouterAgent(BaseAgent):
   "intent": "意图类别",
   "sub_intent": "子意图（可选）",
   "params": {{"建议参数"}},
-  "confidence": 0.0-1.0,
-  "reasoning": "推理过程"
+  "reasoning": "推理过程",
+  "needs_clarification": false,
+  "clarification_question": "",
+  "clarification_options": []
 }}
 
 注意：
 1. 如果是问候语，返回 intent: "greeting"
 2. 如果是闲聊，返回 intent: "chit_chat"
 3. 如果需要多个专家，返回 intent: "multi_specialist"
-4. 置信度要基于实体匹配和上下文判断
-5. 如果用户要求生成报告，设置 needs_report_generation: true"""
+4. 如果用户要求生成报告，设置 needs_report_generation: true
+
+★ 关于 needs_clarification（重要）：
+   判断"这个问题是否【信息不足到无法作答】，必须先问用户"。
+   只在【平行候选无法用常识区分】时才设为 true ——
+   即：你不确定用户指哪一个，且猜错的代价是"答非所问"。
+
+   必须设为 true 的情况（举例）：
+     「税率是多少」→ 哪个税种？企业所得税/增值税/个人所得税…无法区分 → true
+        clarification_question: "您想了解哪个税种的税率？"
+        clarification_options: ["企业所得税", "增值税", "个人所得税", "印花税"]
+     「折旧怎么算」→ 哪种资产的折旧？方法也不同 → true
+
+   必须设为 false 的情况（举例）：
+     「企业所得税税率是多少」→ 税种已明确 → false
+     「比亚迪开发支出是多少」→ 主体+指标明确 → false
+     「我们公司上月开了发票，怎么申报增值税」→ 信息足够 → false
+     「你好」→ 问候语 → false
+
+   判断原则（不要猜）：
+   · 有明确主体/对象（公司名、税种、指标、日期）→ 通常 false，直接答
+   · 只有"泛泛的类别词"（税率、费用、成本、风险）且没有限定 → 通常 true
+   · 若能从常识推断出最可能的答案 → false（不要为小概率歧义打断用户）
+   · 不确定时倾向于 false（先答，答偏了用户会补充）—— 追问只用于【明显无法作答】
+
+   question 要求：具体、指出歧义点（如"您想了解哪个税种？"），
+                  不要写"请详细描述您的问题"这类空泛的话。
+   options 要求：2-4 个【具体选项】（用户可直接点选），不是笼统的类别。"""
         
         text_lower = text.lower()
         report_keywords = [
@@ -850,7 +878,19 @@ class IntentRouterAgent(BaseAgent):
                 print(f"⚠️ [意图路由智能体] 置信度({confidence})<=阈值({self.confidence_threshold})，使用规则匹配补充")
             
             if should_use_rule:
+                # 只替换【意图/置信度】等规则更可信的字段，
+                # 但保留 LLM 的【澄清判断】—— 它是对"是否信息不足"的语义判断，
+                # 规则层给不出（原实现整个 result = rule_result，把 clarification
+                # 字段一起丢了，导致 LLM 判出的"需澄清"失效）。
+                _clar = {
+                    "needs_clarification": result.get("needs_clarification"),
+                    "clarification_question": result.get("clarification_question"),
+                    "clarification_options": result.get("clarification_options"),
+                }
                 result = rule_result
+                for _k, _v in _clar.items():
+                    if _v not in (None, ""):
+                        result[_k] = _v
             
             result["needs_report_generation"] = needs_report
             
@@ -961,13 +1001,37 @@ class IntentRouterAgent(BaseAgent):
             else str(intent_result.routing_strategy)
         )
         
-        clarification = await self.clarification_service.detect_ambiguous_input(
-            query=user_input,
-            intent=intent_str,
-            confidence=intent_result.confidence,
-            entities=[e.model_dump() for e in intent_result.entities],
-            routing_strategy=routing_str
-        )
+        # ── 澄清判断：优先用 LLM 的判断（Claude Code 式）──
+        # 为什么不用启发式规则：本项目三次尝试（单字判意图 / 置信度当澄清依据 /
+        # 实体锚点）都因"启发式判断不了语义"而失败。LLM 判意图时已在同一 prompt
+        # 里被要求判断"是否信息不足"，直接采用其结果，不额外调用。
+        # 启发式（clarification_service）降级为兜底 —— 仅当 LLM 未给出判断时使用
+        # （如走了规则分类分支、或 LLM 输出解析失败）。
+        clarification = None
+        _llm_needs_clar = intent_result_dict.get("needs_clarification")
+        if _llm_needs_clar:
+            _question = (intent_result_dict.get("clarification_question") or "").strip()
+            _options = intent_result_dict.get("clarification_options") or []
+            if _question and isinstance(_options, list):
+                clarification = ClarificationRequest(
+                    type=ClarificationType.INTENT_CLARIFICATION,
+                    question=_question,
+                    suggestions=[str(o) for o in _options][:4],
+                    reason="意图存在多个平行候选，需用户明确",
+                    required=True,
+                    placeholder="也可直接输入您的具体问题...",
+                )
+                logger.info(f"[IntentRouter] LLM 判定需澄清: {_question[:40]}")
+        elif _llm_needs_clar is None:
+            # LLM 未参与判断（规则分支）→ 退回启发式兜底
+            clarification = await self.clarification_service.detect_ambiguous_input(
+                query=user_input,
+                intent=intent_str,
+                confidence=intent_result.confidence,
+                entities=[e.model_dump() for e in intent_result.entities],
+                routing_strategy=routing_str
+            )
+        # _llm_needs_clar is False → 明确不需要澄清，不再走启发式（避免规则误判覆盖 LLM 判断）
         
         return IntentRoutingResult(
             is_simple=False,
