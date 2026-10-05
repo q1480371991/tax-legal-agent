@@ -206,6 +206,9 @@ class RAGRetrievalContext:
     retrieval_time_ms: float
     tenant_id: str
     filters_applied: Dict[str, Any]
+    # 图谱上下文（实体/关系段）—— 由 unified_retriever 级联扩展产出，
+    # 供上层拼进提示词（原纯向量检索无此字段）
+    graph_context: str = ""
 
 
 class RetrievalCache:
@@ -412,35 +415,41 @@ class TenantIsolatedRAGRetriever:
         logger.info(f"📚 [RAG检索器] 开始检索 | 租户: {tenant_id} | 查询: {query[:50]}...")
         
         try:
-            query_embedding = await self._get_query_embedding(query)
-            
-            # 检查embedding是否有效（全零向量表示输入为空）
-            if not query_embedding or all(v == 0.0 for v in query_embedding):
-                logger.warning("⚠️ [RAG检索器] 查询embedding无效（可能查询文本为空），跳过向量搜索")
-                return []
-            
-            raw_results = await self._search_vectors(
-                query_embedding=query_embedding,
-                filters=filters,
-                top_k=top_k * 2
+            # ── 检索内核：复用 unified_retriever ──
+            # 原实现是"纯向量检索"（_search_vectors），能力远弱于统一检索层
+            # （缺 BM25 稀疏检索、RRF 融合、Rerank、图谱级联扩展）。
+            # 这里换用 unified_retriever —— 它已含完整检索能力，且只要 tenant_id
+            # 即可工作（kb_id 为空时图谱那步会用传入的 tenant_id）。
+            # 本类保留的价值在其【运营层】：限流、访问校验、结果缓存、租户隔离过滤。
+            from app.services.unified_retriever import unified_retriever
+            ur = await unified_retriever.retrieve(
+                query=query,
+                kb_id=None,                     # 多智能体按租户检索，不绑定单一知识库
+                session_id="multi_agent",
+                user_id="multi_agent",
+                tenant_id=tenant_id,
+                top_k=top_k,
+                enable_routing=False,           # 编排层自己控制流程
+                enable_graph=True,              # 启用图谱级联扩展
+                enable_rerank=True,
             )
-            
-            filtered_results = self._filter_and_rank_results(
-                raw_results=raw_results,
-                min_score=min_relevance_score
-            )[:top_k]
-            
+            chunks = ur.get("rag_results", []) or []
+            combined = ur.get("combined_context", "") or ""
+
+            # unified_retriever 返回的 chunk 结构 → RAGRetrievalResult
             rag_results = [
                 RAGRetrievalResult(
-                    content=self._extract_content(r),
-                    source=self._extract_source(r),
-                    doc_type=self._extract_doc_type(r),
-                    confidence=self._extract_confidence(r),
-                    metadata=self._extract_metadata(r),
-                    relevance_score=r.get("score", 0)
+                    content=(c.get("content") or ""),
+                    source=(c.get("meta_info") or {}).get("source", "") or c.get("source_file", ""),
+                    doc_type=self._extract_doc_type(c),
+                    confidence=float(c.get("rerank_score") or c.get("score") or 0.0),
+                    metadata=c.get("meta_info") or {},
+                    relevance_score=float(c.get("rerank_score") or c.get("score") or 0.0),
                 )
-                for r in filtered_results
+                for c in chunks
             ]
+            # 图谱上下文（关系等）一并带出，供上层拼进提示词
+            graph_ctx = (ur.get("graph_results") or {}).get("context", "") or ""
             
             retrieval_time = (time.time() - start_time) * 1000
             
@@ -450,7 +459,8 @@ class TenantIsolatedRAGRetriever:
                 total_results=len(rag_results),
                 retrieval_time_ms=retrieval_time,
                 tenant_id=tenant_id,
-                filters_applied=filters
+                filters_applied=filters,
+                graph_context=graph_ctx,
             )
             
             if self.use_cache and not bypass_cache:

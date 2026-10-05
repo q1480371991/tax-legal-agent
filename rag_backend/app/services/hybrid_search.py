@@ -68,7 +68,12 @@ class HybridSearchEngine:
             sparse_results = []
 
         if not dense_results and not sparse_results:
-            logger.error("[HybridSearch] 两路检索均失败")
+            # 注意：这不一定表示"检索出错"——两路都可能【正常返回空】
+            # （典型原因：过滤条件过严，候选被 WHERE 全部筛掉）。
+            # 调用方 unified_retriever 有"软过滤回退"会放宽条件重试，
+            # 故此处用 info 而非 error，避免把"已处理的降级"打成告警。
+            # 真正的异常（异常对象）已在上方被捕获并降级，另行告警。
+            logger.info("[HybridSearch] 两路均返回空（可能是过滤条件过严，调用方将尝试放宽）")
             return []
 
         w_dense, w_sparse = self.DOMAIN_WEIGHTS.get(domain, (0.5, 0.5))
