@@ -112,6 +112,49 @@ class IntentRoutingResult(BaseModel):
     )
 
 
+# ── 跨领域请求的句式判定 ──
+# 为什么不用词表：单纯"出现 ≥2 个领域词"会把「财务和法务的区别是什么」
+# （对比题，单专家即可）也判成跨领域。真正表示"要多个领域分别处理"的是
+# 【跨领域请求的结构】：涉及/涵盖/从…角度 + 两个领域 + 处理动词。
+_DOMAIN_WORDS = {
+    "finance": ("财务", "会计", "报表", "资金", "成本", "预算"),
+    "tax": ("税务", "税", "纳税", "发票", "税收"),
+    "legal": ("法务", "法律", "合同", "合规", "诉讼"),
+}
+# "请求跨领域处理"的结构性信号
+_CROSS_DOMAIN_CUES = (
+    "涉及", "涵盖", "结合", "分别从", "从.*角度", "多个方面", "各方面",
+    "综合", "全面", "以及",
+    # 并列/递进连接词 —— 表示"多个领域都要处理"
+    "和", "与", "、", "并", "同时", "既", "又",
+)
+# "对比/区别"类 —— 会命中领域词但只需单专家
+_CONTRAST_CUES = ("区别", "差异", "不同", "比较", "对比", "哪个更", "谁更")
+
+
+def _detect_cross_domain(text_lower: str) -> list:
+    """检测"需要多个领域专家分别处理"的请求，返回领域列表。
+
+    判据为【结构信号 + 多领域 + 非对比题】，而非单纯词表命中：
+      「分析…风险，涉及财务和法务」→ 跨领域 ✅
+      「财务和法务的区别是什么」   → 对比题，单专家 ❌
+    """
+    if any(c in text_lower for c in _CONTRAST_CUES):
+        return []
+    # 命中的领域（去重）
+    hit = [d for d, words in _DOMAIN_WORDS.items()
+           if any(w in text_lower for w in words)]
+    if len(hit) < 2:
+        return []
+    # 需要"请求跨领域处理"的结构信号 —— 单有多个领域词不够
+    import re as _re
+    has_cue = any(
+        (_re.search(cue, text_lower) if cue == "从.*角度" else cue in text_lower)
+        for cue in _CROSS_DOMAIN_CUES
+    )
+    return hit if has_cue else []
+
+
 # ── 报告类意图的句式判定 ──
 # 为什么不用单字匹配：中文里"报告"既可是"话题"（「XX报告中的YY」= 查询），
 # 也可是"动作对象"（「生成一份报告」= 要做事）。单字匹配无法区分语境，
@@ -524,9 +567,14 @@ class IntentRouterAgent(BaseAgent):
     def _determine_required_specialists(
         self,
         intent: IntentCategory,
-        routing_strategy: RoutingStrategy
+        routing_strategy: RoutingStrategy,
+        text: str = "",
     ) -> List[str]:
-        """确定需要的专家"""
+        """确定需要的专家。
+
+        text 用于检测【显式跨领域请求】（如"涉及财务和法务"）——
+        这类查询即使被 LLM 判成单一领域意图，也应按跨领域派多个专家。
+        """
         intent_specialist_map = {
             IntentCategory.FINANCIAL_ANALYSIS: ["finance"],
             IntentCategory.ACCOUNTING_QUERY: ["finance"],
@@ -544,7 +592,15 @@ class IntentRouterAgent(BaseAgent):
         }
         
         specialists = intent_specialist_map.get(intent, [])
-        
+
+        # 显式跨领域请求（"涉及财务和法务"）优先于单领域意图判定 ——
+        # 否则这类请求只会派单专家，多专家协作形同虚设。
+        if text:
+            cross = _detect_cross_domain(text.lower())
+            if len(cross) >= 2:
+                logger.info(f"[IntentRouter] 检测到跨领域请求，专家: {cross}")
+                return cross
+
         if intent in [IntentCategory.COMPLEX_TASK, IntentCategory.MULTI_SPECIALIST]:
             specialists = ["finance", "tax", "legal"]
         
@@ -864,7 +920,8 @@ class IntentRouterAgent(BaseAgent):
         
         specialists = self._determine_required_specialists(
             intent_result_dict["intent"],
-            routing_strategy
+            routing_strategy,
+            text=user_input,
         )
         
         needs_review = self._should_require_human_review(
