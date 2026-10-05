@@ -112,6 +112,31 @@ class IntentRoutingResult(BaseModel):
     )
 
 
+# ── 报告类意图的句式判定 ──
+# 为什么不用单字匹配：中文里"报告"既可是"话题"（「XX报告中的YY」= 查询），
+# 也可是"动作对象"（「生成一份报告」= 要做事）。单字匹配无法区分语境，
+# 会把「报告中的开发支出是多少」误判为"要生成报告"。
+# 解法：判据的形态从【出现某词】升级为【动作词 + 报告 同现】。
+_REPORT_ACTION_WORDS = (
+    "生成", "输出", "写", "撰写", "起草", "出具", "给我", "帮我出",
+    "做一份", "做份", "整理", "汇总成", "编一份",
+)
+_REPORT_NOUNS = ("报告", "分析文档", "分析材料", "分析报告", "总结")
+
+
+def _is_report_request(text_lower: str) -> bool:
+    """判断是否为"生成报告"类请求（动作句式），而非"报告中的…"这类话题查询。"""
+    # 先排除修饰结构：「报告中的 / 报告里 / 报告内 / 报告的内容」—— 这些是查询
+    if any(f"{n}中的" in text_lower or f"{n}里" in text_lower
+           or f"{n}内" in text_lower or f"{n}的内容" in text_lower
+           for n in ("报告", "报表")):
+        return False
+    # 动作词 + 报告类名词 同现
+    return any(n in text_lower for n in _REPORT_NOUNS) and any(
+        a in text_lower for a in _REPORT_ACTION_WORDS
+    )
+
+
 class IntentRouterAgent(BaseAgent):
     """
     意图路由智能体
@@ -613,12 +638,26 @@ class IntentRouterAgent(BaseAgent):
             "补贴": IntentCategory.KNOWLEDGE_QUERY,
             "优惠": IntentCategory.KNOWLEDGE_QUERY,
             "合规": IntentCategory.COMPLIANCE_CHECK,
-            "报告": IntentCategory.REPORT_GENERATION,
+            # 「报告」不在此处单字匹配 —— 见 _is_report_request()：
+            # "报告"是话题词（「XX报告中的YY」是查询），只有出现在【动作句式】
+            # （生成/输出/给我…报告）里才表示"要生成报告"。
             "查询": IntentCategory.KNOWLEDGE_QUERY,
             "知识库": IntentCategory.KNOWLEDGE_QUERY,
             # 🆕 技能关键词与领域关键词的多词组合已在 multi_patterns 中处理
         }
         
+        # 报告类意图：仅在【动作句式】下成立 —— 见 _is_report_request。
+        # 判定的形态是"动作 + 报告"，而非"出现'报告'二字"。这样
+        # 「生成一份财务报告」→ report_generation ✅
+        # 「XX报告中的开发支出是多少」→ 不命中，继续走领域词匹配 ✅
+        if _is_report_request(text_lower):
+            return {
+                "intent": IntentCategory.REPORT_GENERATION,
+                "confidence": 0.9,
+                "reasoning": "检测到报告生成请求（动作句式）",
+                "needs_report_generation": True,
+            }
+
         for keyword, intent in keyword_map.items():
             if keyword in text_lower:
                 return {
@@ -736,9 +775,20 @@ class IntentRouterAgent(BaseAgent):
             rule_confidence = rule_result.get("confidence", 0.0)
             
             should_use_rule = False
-            if detected_intent in generic_intents and rule_confidence >= 0.8:
+            # ① LLM 判"不知道"（UNKNOWN）时，规则层的任何结果都比 unknown 有信息 ——
+            #    不再要求 rule_confidence >= 0.8。原实现要求高置信度，导致
+            #    LLM=unknown(0.95) + 规则=knowledge_query(0.5) 时兜底失效，
+            #    unknown 被采纳 → requires_specialists 为空 → 触发"多专家兜底"
+            #    派出全部三个专家（过度派发）。
+            #    注意：这是"信息量不对称"—— unknown 是"无信息"，规则结果至少是"有倾向"。
+            if detected_intent == IntentCategory.UNKNOWN and rule_result.get("intent") != IntentCategory.UNKNOWN:
+                should_use_rule = True
+                print("⚠️ [意图路由智能体] LLM判unknown，改用规则结果")
+            # ② LLM 判了通用意图且规则高置信 → 规则覆盖
+            elif detected_intent in generic_intents and rule_confidence >= 0.8:
                 should_use_rule = True
                 print("⚠️ [意图路由智能体] LLM返回通用意图，使用规则匹配补充")
+            # ③ LLM 自身没把握 → 规则更可信则用规则
             elif confidence <= self.confidence_threshold and rule_confidence > confidence:
                 should_use_rule = True
                 print(f"⚠️ [意图路由智能体] 置信度({confidence})<=阈值({self.confidence_threshold})，使用规则匹配补充")
