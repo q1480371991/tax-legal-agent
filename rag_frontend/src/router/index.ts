@@ -16,16 +16,24 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: false },
   },
   {
+    // 统一智能问答入口 —— 用户不再需要在"单/多智能体"之间选择。
+    // 后端按意图自动分流（单专家/多专家），前端展示也随之自适应。
     path: '/',
     name: 'chat',
+    component: () => import('@/views/MultiAgentChatView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
+    // 旧版单智能体对话页 —— 保留但不在菜单中展示（可回退、可对照）。
+    path: '/classic-chat',
+    name: 'classic-chat',
     component: () => import('@/views/ModernChatView.vue'),
     meta: { requiresAuth: true },
   },
   {
+    // 兼容旧链接：/multi-agent 重定向到统一入口
     path: '/multi-agent',
-    name: 'multi-agent-chat',
-    component: () => import('@/views/MultiAgentChatView.vue'),
-    meta: { requiresAuth: true },
+    redirect: '/',
   },
   {
     path: '/search',

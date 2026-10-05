@@ -72,7 +72,8 @@ const taskProgress = computed(() => {
 })
 
 function goToMultiAgent() {
-  router.push('/multi-agent')
+  // 统一入口：任务进度页即主对话页（原 /multi-agent 已合并到 /）
+  router.push('/')
 }
 
 function dismissTask() {

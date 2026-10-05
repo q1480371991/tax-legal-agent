@@ -187,8 +187,9 @@ const menuGroups = computed<MenuGroup[]>(() => {
       icon: MessageSquare,
       defaultExpanded: true,
       items: [
+        // 统一入口：用户不再区分"单智能体/多智能体"——后端按意图自动分流。
+        // 旧版单智能体页保留在 /classic-chat（可回退、可对照），但不在菜单展示。
         { path: '/', icon: MessageSquare, label: '智能对话', name: 'chat' },
-        { path: '/multi-agent', icon: Brain, label: '多智能体协作', name: 'multi-agent-chat' },
         { path: '/group-chat', icon: UsersRound, label: '群组聊天', name: 'group-chat' },
       ]
     },
