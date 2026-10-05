@@ -99,6 +99,7 @@ class UnifiedRetriever:
         candidates = await hybrid_search_engine.search(
             query=query,
             tenant_id=tenant_id,
+            kb_id=kb_id,                # 选了知识库就限定在该库内检索
             domain=domain,
             metadata_filter=metadata_filter,
             jsonb_array_filter=jsonb_array_filter,
@@ -116,7 +117,7 @@ class UnifiedRetriever:
             for weak in ("quarter", "region", "tax_type", "year"):
                 relaxed.pop(weak, None)
                 candidates = await hybrid_search_engine.search(
-                    query=query, tenant_id=tenant_id, domain=domain,
+                    query=query, tenant_id=tenant_id, kb_id=kb_id, domain=domain,
                     metadata_filter=relaxed or None,
                     jsonb_array_filter=jsonb_array_filter,
                 )
@@ -128,7 +129,7 @@ class UnifiedRetriever:
             if not candidates and jsonb_array_filter:
                 # 最后连指标过滤也去掉（它同样可能过严）
                 candidates = await hybrid_search_engine.search(
-                    query=query, tenant_id=tenant_id, domain=domain,
+                    query=query, tenant_id=tenant_id, kb_id=kb_id, domain=domain,
                     metadata_filter=None, jsonb_array_filter=None,
                 )
                 if candidates:
@@ -257,9 +258,24 @@ class UnifiedRetriever:
                     except (ValueError, AttributeError):
                         uuids = []
                     if uuids:
-                        rows = (await db.execute(
-                            select(DocumentChunk).where(DocumentChunk.id.in_(uuids))
-                        )).scalars().all()
+                        # 级联反查需同样遵守知识库边界：图谱实体的 chunk_ids 是
+                        # 摄取时写入的，可能包含【同租户其他知识库】的 chunk。
+                        # 若用户选了知识库 A 而这里不加限制，就会把 B 库的 chunk
+                        # 拉进结果 —— 绕过知识库隔离。
+                        stmt = select(DocumentChunk).where(DocumentChunk.id.in_(uuids))
+                        if kb_id:
+                            from app.models.document import Document as _Doc
+                            import uuid as _uuid2
+                            try:
+                                kb_uuid = _uuid2.UUID(str(kb_id))
+                                stmt = stmt.where(
+                                    DocumentChunk.document_id.in_(
+                                        select(_Doc.id).where(_Doc.kb_id == kb_uuid)
+                                    )
+                                )
+                            except (ValueError, AttributeError):
+                                pass
+                        rows = (await db.execute(stmt)).scalars().all()
                         by_id = {str(r.id): r for r in rows}
                         for rank, cid in enumerate(new_ids, 1):
                             r = by_id.get(cid)

@@ -35,6 +35,7 @@ class HybridSearchEngine:
         self,
         query: str,
         tenant_id: str,
+        kb_id: Optional[str] = None,
         domain: Optional[str] = None,
         metadata_filter: Optional[Dict[str, str]] = None,
         jsonb_array_filter: Optional[Dict[str, str]] = None,
@@ -47,13 +48,13 @@ class HybridSearchEngine:
 
         dense_task = self._search_service.search(
             query=query, top_k=top_k_dense, score_threshold=0.3,
-            tenant_id=tenant_id, domain=domain, metadata_filter=metadata_filter,
-            jsonb_array_filter=jsonb_array_filter,
+            tenant_id=tenant_id, kb_id=kb_id, domain=domain,
+            metadata_filter=metadata_filter, jsonb_array_filter=jsonb_array_filter,
         )
         sparse_task = self._search_service.bm25_search(
             query=query, top_k=top_k_sparse,
-            tenant_id=tenant_id, domain=domain, metadata_filter=metadata_filter,
-            jsonb_array_filter=jsonb_array_filter,
+            tenant_id=tenant_id, kb_id=kb_id, domain=domain,
+            metadata_filter=metadata_filter, jsonb_array_filter=jsonb_array_filter,
         )
 
         dense_results, sparse_results = await asyncio.gather(

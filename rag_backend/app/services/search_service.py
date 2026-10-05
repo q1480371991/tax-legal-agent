@@ -184,6 +184,13 @@ class SearchService:
                     "tenant_id": str(tenant_id),
                 }
 
+                # 🔐 知识库过滤：选了知识库就只在该库内检索。
+                # 原实现只在 tenant_id 为空时用 kb_id 推导租户，检索时【不过滤】——
+                # 导致"选了知识库 A 却检索到整租户"的语义不符。
+                if kb_id:
+                    where_clauses.append("d.kb_id = CAST(:kb_id AS UUID)")
+                    params["kb_id"] = str(kb_id)
+
                 # [v2 增强] 领域过滤
                 if domain:
                     where_clauses.append("c.domain = :domain")
@@ -601,6 +608,7 @@ class SearchService:
         query: str,
         top_k: int = 100,
         tenant_id: str = None,
+        kb_id: str = None,
         domain: str = None,
         metadata_filter: Optional[Dict[str, str]] = None,
         jsonb_array_filter: Optional[Dict[str, str]] = None,
@@ -642,6 +650,11 @@ class SearchService:
                 "d.tenant_id = :tenant_id",
             ]
             params = {"q": tsq, "tenant_id": str(tenant_id), "limit": int(top_k)}
+
+            # 🔐 知识库过滤：与 search() 一致，选了知识库就只在该库内检索
+            if kb_id:
+                where_clauses.append("d.kb_id = CAST(:kb_id AS UUID)")
+                params["kb_id"] = str(kb_id)
 
             if domain:
                 where_clauses.append("c.domain = :domain")
