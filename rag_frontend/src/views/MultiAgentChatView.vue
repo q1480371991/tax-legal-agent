@@ -31,6 +31,7 @@ import {
   AlertCircle,
   History,
   Activity,
+  Trash2,
 } from 'lucide-vue-next'
 
 import { marked } from 'marked'
@@ -402,6 +403,13 @@ function restoreDbChat(item: DbHistoryItem) {
   }
   messages.value = [userMsg, assistantMsg]
   sessionId.value = item.session_id
+  // ⚠️ 必须重置右侧状态面板。原先只换 messages，导致面板仍显示上一条对话的
+  //    意图/反思/耗时（真实踩过：看起来"状态栏串了"，开新一轮才恢复正常 ——
+  //    因为 beginTurn 会重置，所以问题只在"切换历史"这条路径上出现）。
+  resetAgentStages()
+  localStorage.removeItem('multi_agent_task_id')
+  localStorage.removeItem('multi_agent_thread_id')
+  taskStore.clearTaskState()
   showHistory.value = false
 }
 
@@ -409,20 +417,48 @@ function restoreDbChat(item: DbHistoryItem) {
 function restoreLocalChat(item: LocalHistoryItem) {
   messages.value = item.messages.map(m => ({ ...m, timestamp: new Date(m.timestamp) }))
   sessionId.value = item.sessionId
+  resetAgentStages()
+  localStorage.removeItem('multi_agent_task_id')
+  localStorage.removeItem('multi_agent_thread_id')
+  taskStore.clearTaskState()
   showHistory.value = false
 }
 
-function deleteLocalHistoryItem(id: string) {
-  localHistory.value = localHistory.value.filter(h => h.id !== id)
+// ─── 删除历史对话 ───────────────────────────────────────────────────────────
+// 后端 /multi-agent/history/{id} 与 DELETE /multi-agent/history，
+// 服务端按 tenant_id + user_id 校验归属，只删自己的记录（子表由外键 CASCADE）。
+async function deleteHistoryItem(item: DbHistoryItem) {
+  if (!confirm(`删除这条历史对话？\n\n${item.user_query}`)) return
   try {
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(localHistory.value))
-  } catch {}
+    const { request } = await import('@/utils/request')
+    await request(`/multi-agent/history/${item.session_id}`, { method: 'DELETE' })
+  } catch (e) {
+    console.error('删除历史对话失败:', e)
+    alert('删除失败，请稍后重试')
+    return
+  }
+  // 乐观移除，避免再拉一次列表
+  dbHistory.value = dbHistory.value.filter(h => h.session_id !== item.session_id)
+  if (sessionId.value === item.session_id) {
+    // 删的正是当前正在看的会话 —— 清空，否则界面停在一条已不存在的记录上
+    resetConversation()
+  }
 }
 
-function clearAllHistory() {
-  localHistory.value = []
+async function clearAllHistory() {
+  if (!confirm('清空全部历史对话？此操作不可撤销。')) return
+  try {
+    const { request } = await import('@/utils/request')
+    await request('/multi-agent/history', { method: 'DELETE' })
+  } catch (e) {
+    console.error('清空历史对话失败:', e)
+    alert('清空失败，请稍后重试')
+    return
+  }
   dbHistory.value = []
+  localHistory.value = []
   try { localStorage.removeItem(HISTORY_KEY) } catch {}
+  resetConversation()
 }
 
 // 统一的 chatHistory computed，DB 优先，本地补充没有 DB 记录的项
@@ -1628,28 +1664,29 @@ function resetAgentStages() {
 
 
 function clearChat() {
-
   archiveCurrentChat()
+  resetConversation()
+  showHistory.value = true
+  loadChatHistory()
+}
 
+/**
+ * 清空当前会话视图与右侧状态面板（不动历史记录本身）。
+ *
+ * ⚠️ 必须连 intentAnalysis / reflectionResult / processingTime 一起清。
+ *    这几个变量驱动右侧「流程面板」，原先切换/清空时漏了它们，
+ *    导致面板还显示上一条对话的意图与反思结果（真实踩过）。
+ */
+function resetConversation() {
   messages.value = []
-
   sessionId.value = null
-
   currentResponse.value = ''
-
   resetAgentStages()
-
   stopPolling()
-
   localStorage.removeItem('multi_agent_task_id')
   localStorage.removeItem('multi_agent_thread_id')
   taskStore.clearTaskState()
-
   clearState()
-
-  showHistory.value = true
-  loadChatHistory()
-
 }
 
 
@@ -2402,22 +2439,38 @@ function renderMessageBody(content: string, index: number): string {
               <History :size="11" class="text-blue-500" />
               历史对话 ({{ dbHistory.length }})
             </span>
-            <Loader2 v-if="historyLoading" :size="11" class="text-gray-400 animate-spin" />
+            <div class="flex items-center gap-2">
+              <Loader2 v-if="historyLoading" :size="11" class="text-gray-400 animate-spin" />
+              <button
+                v-if="dbHistory.length"
+                @click="clearAllHistory"
+                :disabled="historyLoading"
+                class="text-[10px] text-red-500 hover:text-red-700 hover:underline disabled:opacity-50"
+                title="删除全部历史对话"
+              >清空</button>
+            </div>
           </div>
           <div v-if="!historyLoading && !dbHistory.length" class="text-xs text-gray-400 text-center py-4">暂无历史记录</div>
           <div v-if="dbHistory.length" class="space-y-1.5 max-h-64 overflow-y-auto pr-0.5">
             <div
               v-for="item in dbHistory"
               :key="item.session_id"
-              class="group bg-white border border-gray-200 rounded p-2 cursor-pointer hover:border-blue-300 hover:bg-blue-50 transition-all"
+              class="group relative bg-white border border-gray-200 rounded p-2 cursor-pointer hover:border-blue-300 hover:bg-blue-50 transition-all"
               @click="restoreDbChat(item)"
             >
-              <p class="text-xs text-gray-800 line-clamp-2 leading-relaxed">{{ item.user_query }}</p>
+              <p class="text-xs text-gray-800 line-clamp-2 leading-relaxed pr-5">{{ item.user_query }}</p>
               <div class="flex items-center gap-2 mt-1 flex-wrap">
                 <span class="text-[10px] text-gray-400">{{ formatHistoryDate(item.created_at || '') }}</span>
                 <span v-if="item.primary_intent" class="text-[10px] px-1 bg-blue-100 text-blue-700 rounded">{{ item.primary_intent }}</span>
                 <span v-if="item.specialists?.length" class="text-[10px] text-gray-400">{{ item.specialists.join('·') }}</span>
               </div>
+              <button
+                @click.stop="deleteHistoryItem(item)"
+                class="absolute top-1.5 right-1.5 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-600 transition-opacity"
+                title="删除这条历史对话"
+              >
+                <Trash2 :size="12" />
+              </button>
             </div>
           </div>
         </div>

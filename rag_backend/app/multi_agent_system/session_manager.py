@@ -141,21 +141,58 @@ class MultiAgentSessionManager:
         result = await self.db.execute(query)
         return list(result.scalars().all())
     
-    async def delete_session(self, session_id: str, tenant_id: str) -> bool:
-        """删除会话（级联删除相关数据）"""
-        result = await self.db.execute(
-            delete(MultiAgentSession)
-            .where(
-                MultiAgentSession.session_id == session_id,
-                MultiAgentSession.tenant_id == tenant_id
-            )
-        )
+    async def delete_session(
+        self,
+        session_id: str,
+        tenant_id: str,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """删除会话（子表由外键 CASCADE 一并删除）。
+
+        Args:
+            session_id: 会话ID
+            tenant_id: 租户ID（隔离边界，必填）
+            user_id: 用户ID。会话是用户可见的记录，调用方应传入以严格校验，
+                     避免同租户下用户互相删除对方的会话。
+        """
+        conditions = [
+            MultiAgentSession.session_id == session_id,
+            MultiAgentSession.tenant_id == tenant_id,
+        ]
+        if user_id:
+            try:
+                conditions.append(MultiAgentSession.user_id == uuid.UUID(user_id))
+            except (ValueError, AttributeError):
+                # user_id 不是合法 UUID —— 调用方传错了。宁可查不到，也不要放宽条件误删。
+                logger.warning("delete_session 收到非法 user_id，拒绝执行: %r", user_id)
+                return False
+
+        result = await self.db.execute(delete(MultiAgentSession).where(*conditions))
         await self.db.commit()
-        
+
         if result.rowcount > 0:
             logger.info(f"删除多智能体会话: {session_id}")
             return True
         return False
+
+    async def delete_all_sessions(
+        self,
+        tenant_id: str,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """删除某用户在某租户下的全部会话，返回删除条数。"""
+        conditions = [MultiAgentSession.tenant_id == tenant_id]
+        if user_id:
+            try:
+                conditions.append(MultiAgentSession.user_id == uuid.UUID(user_id))
+            except (ValueError, AttributeError):
+                logger.warning("delete_all_sessions 收到非法 user_id，拒绝执行: %r", user_id)
+                return 0
+
+        result = await self.db.execute(delete(MultiAgentSession).where(*conditions))
+        await self.db.commit()
+        logger.info(f"清空多智能体会话: tenant={tenant_id} user={user_id} 共 {result.rowcount} 条")
+        return result.rowcount or 0
     
     async def save_specialist_result(
         self,

@@ -885,6 +885,51 @@ async def list_ma_history(
     }
 
 
+@router.delete("/history/{session_id}")
+async def delete_ma_history(
+    session_id: str,
+    current_user: User = Depends(deps.get_current_user),
+    tenant_context: dict = Depends(deps.get_tenant_context),
+    db_session: AsyncSession = Depends(deps.get_db),
+):
+    """删除一条多智能体对话历史（子表记录由外键 CASCADE 一并删除）。
+
+    只允许删除自己名下的会话 —— 传入 user_id 做归属校验，避免同租户
+    用户之间互相删除对话记录。
+    """
+    from app.multi_agent_system.session_manager import MultiAgentSessionManager
+
+    manager = MultiAgentSessionManager(db_session)
+    deleted = await manager.delete_session(
+        session_id=session_id,
+        tenant_id=tenant_context["tenant_id"],
+        user_id=str(current_user.id),
+    )
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="历史对话不存在或无权删除")
+
+    return {"success": True, "session_id": session_id}
+
+
+@router.delete("/history")
+async def clear_ma_history(
+    current_user: User = Depends(deps.get_current_user),
+    tenant_context: dict = Depends(deps.get_tenant_context),
+    db_session: AsyncSession = Depends(deps.get_db),
+):
+    """清空当前用户在当前租户下的全部多智能体对话历史。"""
+    from app.multi_agent_system.session_manager import MultiAgentSessionManager
+
+    manager = MultiAgentSessionManager(db_session)
+    deleted_count = await manager.delete_all_sessions(
+        tenant_id=tenant_context["tenant_id"],
+        user_id=str(current_user.id),
+    )
+
+    return {"success": True, "deleted": deleted_count}
+
+
 @router.get("/sessions/{session_id}", response_model=SessionStatus)
 async def get_session_status(
     session_id: str,
