@@ -890,6 +890,11 @@ onBeforeUnmount(() => {
   taskStore.saveTaskState()
   saveState()
   saveSettings()
+
+  // 组件真正卸载时才撤销澄清卡片的全局回调（见 handleUserClarification 的说明）
+  delete window.handleClarificationSelect
+  delete window.handleClarificationSubmit
+  delete window.handleClarificationDismiss
 })
 
 
@@ -1561,9 +1566,13 @@ function showClarificationDialog(data: any) {
 }
 
 async function handleUserClarification(text: string) {
-  delete window.handleClarificationSelect
-  delete window.handleClarificationSubmit
-  delete window.handleClarificationDismiss
+  // ⚠️ 不要在这里 delete window.handleClarification*。
+  //    澄清卡片是用 v-html 注入的，按钮的 onclick 只能调 window 上的全局函数，
+  //    而该函数只在 onMounted 注册一次、之后不再注册（showClarificationDialog
+  //    只服务轮询那条路径，SSE 路径不经过它）。若在这里删除，用户点过一次澄清后，
+  //    页面上【所有后续】澄清卡片的按钮都会永久失效——按钮照常显示、点击静默无反应，
+  //    且不会有任何报错或网络请求（真实踩过）。
+  //    撤销注册改在 onBeforeUnmount 做，那才是唯一正确的时机。
   
   const userMsg: Message = {
     id: createMessageId(),
