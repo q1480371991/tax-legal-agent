@@ -164,8 +164,27 @@ class QualityReviewFunction:
             response = await self.llm_adapter.agenerate(prompts=[prompt])
             result = self._parse_response(response.content)
 
-            is_acceptable = result.get("is_quality_acceptable", False)
+            # 统一裁决点：以 overall 分数为准，与提示词中声明的
+            # 「overall score >= 0.6 时应判为可接受」保持一致。
+            # LLM 偶尔给出 is_quality_acceptable=false 但 overall=0.72 这类自相矛盾的
+            # 结果；若放任不管，调用方（反思节点）会据 false 反复打回重做，
+            # 用户侧表现为长时间无响应。这里一次性纠正，避免每个消费者各判一套。
             score = result.get('scores', {}).get('overall', result.get('score', 0.0))
+            try:
+                score = float(score)
+            except (TypeError, ValueError):
+                score = 0.0
+            by_score = score >= self.quality_threshold
+            is_acceptable = result.get("is_quality_acceptable")
+            if is_acceptable is None or bool(is_acceptable) != by_score:
+                if is_acceptable is not None:
+                    logger.warning(
+                        "⚠️ [QualityReview] 审查结论自相矛盾 (acceptable=%s, score=%.2f)，以分数为准",
+                        is_acceptable, score,
+                    )
+                is_acceptable = by_score
+            result["is_quality_acceptable"] = is_acceptable
+
             logger.info(f"🔍 [QualityReview] 审查完成: acceptable={is_acceptable}, score={score:.2f}")
 
             return result

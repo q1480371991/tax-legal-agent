@@ -48,6 +48,10 @@ from app.skills.skill_matcher import SkillMatcher
 
 logger = logging.getLogger(__name__)
 
+# 反思质量审查的可接受阈值 —— 与 app/prompts/llm_functions/quality_review.md
+# 中声明的「overall score >= 0.6 时应判为可接受」保持一致。
+QUALITY_ACCEPT_THRESHOLD = 0.6
+
 
 class LatencyTracker:
     """延迟追踪器"""
@@ -139,32 +143,17 @@ class Nodes:
             logger.warning(f"[sanitize] 检测到工具调用残留，替换为友好消息")
             return "抱歉，系统处理时遇到异常，请稍后重试。"
 
-        # 1. 去除 ```json ... ``` 包装
-        json_block = _re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, _re.DOTALL)
-        if json_block:
-            inner = json_block.group(1).strip()
-            # 如果内部是 JSON，尝试提取 executive_summary 或 description 字段
-            if inner.startswith("{") and inner.endswith("}"):
-                try:
-                    import json as _json
-                    parsed = _json.loads(inner)
-                    # 优先提取文本内容
-                    summary = (parsed.get("executive_summary") or
-                               parsed.get("description") or
-                               parsed.get("output_data", {}).get("executive_summary") or
-                               parsed.get("blackboard_action", {}).get("output_data", {}).get("executive_summary"))
-                    if summary and isinstance(summary, str):
-                        return summary.strip()
-                    text = inner  # 无法提取有用文本，继续检查
-                except _json.JSONDecodeError:
-                    text = inner  # 不是合法 JSON，直接用内部文本
+        # 1. 若整篇回答被**单个** ``` ``` 围栏包裹，去掉围栏（内容原样保留）
+        #    ⚠️ 旧实现用 re.search 取"第一个"代码块的内容替换整篇回答，导致只要
+        #    回答里出现任何公式/示例代码块，整篇就会被截成那一小段
+        #    （实测「个人所得税税率是多少」的 1855 字符回答 → 81 字符）。
+        #    这里改为**锚定全文**：只有整篇就是一个代码块时才解包。
+        #    解包后的 JSON 由第 3 步统一提取字段，此处不再重复处理。
+        whole_fence = _re.match(r"\s*```[a-zA-Z]*\s*\n?(.*?)\n?```\s*$", text, _re.DOTALL)
+        if whole_fence:
+            text = whole_fence.group(1).strip()
 
-        # 2. 去除 ``` ... ``` 代码块（非 JSON），取纯文本
-        code_block = _re.search(r"```\s*\n?(.*?)```", text, _re.DOTALL)
-        if code_block:
-            text = code_block.group(1).strip()
-
-        # 3. 检测纯 JSON 对象（无代码块包裹），提取文本字段
+        # 2. 检测纯 JSON 对象（无代码块包裹或被上面解包后），提取文本字段
         stripped2 = text.strip()
         if stripped2.startswith("{") and stripped2.endswith("}"):
             try:
@@ -183,13 +172,13 @@ class Nodes:
             except _json.JSONDecodeError:
                 pass  # 不是 JSON，继续
 
-        # 4. 检测纯错误内容：短消息且包含"失败"/"error"等关键词
+        # 3. 检测纯错误内容：短消息且包含"失败"/"error"等关键词
         result = text.strip()
         if len(result) < 50 and any(kw in result for kw in ["失败", "error", "异常", "出错", "failed", "exception"]):
             logger.warning(f"[sanitize] 检测到错误内容短消息，替换: {result[:50]}")
             return f"抱歉，系统处理时遇到异常：{result[:100]}。请稍后重试。"
 
-        # 5. 检测非常短且无实质内容的回答（< 15 字符）
+        # 4. 检测非常短且无实质内容的回答（< 15 字符）
         if len(result) < 15:
             logger.warning(f"[sanitize] 回答过短 ({len(result)} 字符)，补充友好消息")
             if not result:
@@ -605,7 +594,6 @@ class Nodes:
         if not state.get("enable_reflection", self.orchestrator.enable_reflection):
             logger.info("[reflection] disabled, skip quality review")
             return {
-                **state,
                 "reflection_result": {"score": 1.0, "acceptable": True, "skipped": True},
                 "retry_count": state.get("retry_count", 0)
             }
@@ -658,14 +646,17 @@ class Nodes:
             )
             
             actual_score = quality_result.get('scores', {}).get('overall', quality_result.get('score', 0.0))
-            is_acceptable = quality_result.get('is_quality_acceptable', quality_result.get('acceptable', False))
+            # 裁决已由 review_quality() 内部按阈值统一完成（见 quality_review_function.py），
+            # 这里只做兜底：字段缺失时才用本地阈值判断，避免出现两套阈值各判一次。
+            is_acceptable = quality_result.get('is_quality_acceptable')
+            if is_acceptable is None:
+                is_acceptable = actual_score >= QUALITY_ACCEPT_THRESHOLD
 
             logger.info(f"[反思] 质量分数: {actual_score:.2f}, 可接受: {is_acceptable}")
 
             new_retry_count = current_retry + 1 if not is_acceptable else current_retry
 
             updated_state = {
-                **state,
                 # 🆕 P1: 保留 issues，供 _build_repair_plan 判定失败类型，实现针对性打回
                 "reflection_result": {
                     "score": actual_score,
@@ -682,7 +673,6 @@ class Nodes:
         except Exception as e:
             logger.warning(f"[反思] 审核异常，标记跳过: {e}")
             return {
-                **state,
                 "reflection_result": {
                     "score": 0.5,          # 降一半置信度
                     "acceptable": True,     # 仍然放行（业务连续性）
@@ -4254,6 +4244,12 @@ class AgentOrchestrator:
     
     def _format_tax_result(self, result: Dict[str, Any]) -> str:
         """格式化税务专家结果"""
+        # 🆕 纯文本回答直接返回（与 _format_finance_result 保持一致）
+        # 不读 text_answer 会退回下面的模板拼装，产出「未知税种 / 未提供」的空报告
+        text_answer = result.get("text_answer")
+        if text_answer:
+            return Nodes._sanitize_llm_text(str(text_answer))
+
         try:
             # 优先使用分析报告字段
             analysis_report = result.get("analysis_report")
@@ -4477,6 +4473,11 @@ class AgentOrchestrator:
     
     def _format_legal_result(self, result: Dict[str, Any]) -> str:
         """格式化法务专家结果"""
+        # 🆕 纯文本回答直接返回（与 _format_finance_result 保持一致）
+        text_answer = result.get("text_answer")
+        if text_answer:
+            return Nodes._sanitize_llm_text(str(text_answer))
+
         try:
             # 提取分析结果
             analysis = result.get("analysis", {})
