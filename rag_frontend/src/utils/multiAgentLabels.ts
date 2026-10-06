@@ -46,11 +46,11 @@ export const INTENT_DISPLAY: Record<string, { label: string; hint: string }> = {
 /** 路由策略 → 中文标签 + 解释（用户最关心的是"你打算怎么处理"） */
 export const ROUTING_DISPLAY: Record<string, { label: string; hint: string }> = {
   direct_answer: { label: '直接回答', hint: '不检索，直接作答' },
-  rag_retrieval: { label: '知识库检索', hint: '检索企业文档后作答' },
+  rag_retrieval: { label: '知识库检索', hint: '检索企业文档后作答（不派专家）' },
   single_specialist: { label: '单专家', hint: '交由一位领域专家处理' },
   multi_specialist_parallel: { label: '多专家并行', hint: '多位专家同时分析后综合' },
-  multi_specialist_sequential: { label: '多专家串行', hint: '专家依次处理，后一位基于前一位' },
   report_queue: { label: '报告队列', hint: '转入后台生成完整报告' },
+  // 注：multi_specialist_sequential 已从后端移除（专家间无依赖，并行即可）
 }
 
 /** 复杂度 → 标签（后端 low/medium/high/very_high） */
@@ -79,6 +79,10 @@ export interface ReflectionInfo {
   acceptable?: boolean
   /** 质量审查异常时的降级标记 */
   skipped?: boolean
+  /** 已重做次数 */
+  retry_count?: number
+  /** 重做上限 */
+  max_retries?: number
   /** 各维度问题（可能来自 LLM 的结构化 issues，也可能是字符串） */
   issues?: Array<{ dimension?: string; severity?: string; description?: string; suggestion?: string } | string>
 }
@@ -97,6 +101,8 @@ export function normalizeReflection(raw: unknown): ReflectionInfo | null {
     score: typeof o.score === 'number' ? o.score : undefined,
     acceptable: typeof o.acceptable === 'boolean' ? o.acceptable : undefined,
     skipped: typeof o.skipped === 'boolean' ? o.skipped : undefined,
+    retry_count: typeof o.retry_count === 'number' ? o.retry_count : undefined,
+    max_retries: typeof o.max_retries === 'number' ? o.max_retries : undefined,
     issues: issues?.length ? issues : undefined,
   }
 }

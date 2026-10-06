@@ -1625,9 +1625,19 @@ async function handleUserClarification(text: string) {
 /** 反思审核结论 —— 说清"发生了什么"，而不是丢一个分数给用户 */
 function reflectionVerdict(r: ReflectionInfo): string {
   if (r.skipped) return '审查未完成，已直接放行'
-  if (r.acceptable === false) return '未达标，已自动重做'
-  if (r.acceptable === true) return '质量达标，直接采用'
+  if (r.acceptable === false) return '未达标，正在重做'
+  if (r.acceptable === true) {
+    // 最终通过、且中途重做过 —— 让用户知道系统自我纠正过，而不是"卡了一段时间"
+    return r.retry_count ? `重做 ${r.retry_count} 次后达标` : '质量达标，直接采用'
+  }
   return '已完成审核'
+}
+
+/** 重做进度提示（仅在重做中显示），例如 "第 2/3 次重做" */
+function reflectionRetryHint(r: ReflectionInfo): string {
+  if (r.acceptable !== false || !r.retry_count) return ''
+  const total = r.max_retries ?? 3
+  return `第 ${r.retry_count}/${total} 次重做`
 }
 
 /** 各维度问题维度的中文名 */
@@ -2308,6 +2318,10 @@ function renderMessageBody(content: string, index: number): string {
                      :class="reflectionResult.acceptable ? 'text-green-800' : 'text-amber-700'">
                     {{ reflectionVerdict(reflectionResult) }}
                   </p>
+                  <p v-if="reflectionRetryHint(reflectionResult)"
+                     class="text-xs text-amber-700 mb-0.5">
+                    {{ reflectionRetryHint(reflectionResult) }}
+                  </p>
                   <p v-if="reflectionResult.issues?.length" class="text-xs text-green-700 leading-tight">
                     {{ reflectionIssueText(reflectionResult.issues[0]) }}
                   </p>
@@ -2438,6 +2452,9 @@ function renderMessageBody(content: string, index: number): string {
           <p class="text-xs font-medium"
              :class="reflectionResult.acceptable === false ? 'text-amber-700' : 'text-pink-900'">
             {{ reflectionVerdict(reflectionResult) }}
+          </p>
+          <p v-if="reflectionRetryHint(reflectionResult)" class="text-xs text-amber-700 font-medium">
+            {{ reflectionRetryHint(reflectionResult) }}
           </p>
           <p v-if="reflectionResult.issues?.length" class="text-xs text-pink-700 leading-tight mt-0.5">
             {{ reflectionIssueText(reflectionResult.issues[0]) }}

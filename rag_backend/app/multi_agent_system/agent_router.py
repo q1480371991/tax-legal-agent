@@ -300,13 +300,12 @@ class AgentRouter:
                         f"专家: {requires_specialists}"
                     ),
                     requires_all=is_multi,
+                    # 串行模式已移除（专家间无依赖，并行即可）。
+                    # 注：这里原先用 `in ("MULTI_SPECIALIST_PARALLEL",)` 比较【枚举名】，
+                    # 而实际值是 "multi_specialist_parallel"（小写），永远匹配不上，
+                    # 会一律落到 else "sequential"。现改为大小写无关的后缀匹配。
                     execution_mode=(
-                        "parallel"
-                        if routing_strategy
-                        in ("MULTI_SPECIALIST_PARALLEL",)
-                        else "sequential"
-                        if routing_strategy in ("MULTI_SPECIALIST_SEQUENTIAL",)
-                        else "single"
+                        "parallel" if str(routing_strategy).lower().endswith("parallel") else "single"
                     ),
                 )
         

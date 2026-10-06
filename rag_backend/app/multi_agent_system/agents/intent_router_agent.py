@@ -73,8 +73,10 @@ class RoutingStrategy(str, Enum):
     RAG_RETRIEVAL = "rag_retrieval"
     SINGLE_SPECIALIST = "single_specialist"
     MULTI_SPECIALIST_PARALLEL = "multi_specialist_parallel"
-    MULTI_SPECIALIST_SEQUENTIAL = "multi_specialist_sequential"
     REPORT_QUEUE = "report_queue"
+    # 注：原 MULTI_SPECIALIST_SEQUENTIAL 已移除。本系统里专家之间没有依赖关系
+    #     （都基于同一份检索结果各答各的），串行只会更慢且无收益；该枚举也从未
+    #     被 _determine_routing_strategy 产生过，属于纯死代码。
 
 
 class ExtractedEntity(BaseModel):
@@ -397,7 +399,7 @@ class IntentRouterAgent(BaseAgent):
 - **direct_answer**: 直接回答（问候、闲聊）
 - **rag_retrieval**: RAG检索（知识查询）
 - **single_specialist**: 单专家处理
-- **multi_specialist_parallel/sequential**: 多专家并行/串行处理
+- **multi_specialist_parallel**: 多专家并行处理（专家间无依赖，并行即可）
 - **report_queue**: 报告队列
 
 ## 输出格式
@@ -603,14 +605,13 @@ class IntentRouterAgent(BaseAgent):
 
         if intent in [IntentCategory.COMPLEX_TASK, IntentCategory.MULTI_SPECIALIST]:
             specialists = ["finance", "tax", "legal"]
-        
-        if routing_strategy in [
-            RoutingStrategy.MULTI_SPECIALIST_PARALLEL,
-            RoutingStrategy.MULTI_SPECIALIST_SEQUENTIAL
-        ]:
-            if not specialists:
-                specialists = ["finance", "tax", "legal"]
-        
+
+        # 注：这里原有一段 `if routing_strategy in [PARALLEL, SEQUENTIAL]` 的分支，
+        #     但它永远不可达：COMPLEX_TASK/MULTI_SPECIALIST 已在上面被赋成三专家，
+        #     而 _determine_routing_strategy 对其它领域意图只会返回
+        #     SINGLE_SPECIALIST（有 specialists）或 MULTI_SPECIALIST_PARALLEL
+        #     （其对应的 COMPLEX_TASK/MULTI_SPECIALIST 已被覆盖）。已删除。
+
         return specialists if specialists else ["general"]
     
     def _should_require_human_review(

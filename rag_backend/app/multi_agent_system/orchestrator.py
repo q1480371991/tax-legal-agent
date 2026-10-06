@@ -52,6 +52,75 @@ logger = logging.getLogger(__name__)
 # 中声明的「overall score >= 0.6 时应判为可接受」保持一致。
 QUALITY_ACCEPT_THRESHOLD = 0.6
 
+# 「本次回答是否基于企业数据库」的字段名。
+# ⚠️ 历史上每个专家各起一个名字（finance 用 has_financial_db_data、tax 用
+#    has_tax_db_data），而反思的快速通道只检查了 finance 那一个 ——
+#    导致税务/法律专家永远拿不到快速通道，每次白跑一遍 LLM 质量审查（约 3~4 秒）。
+#    这里统一成一族字段名，新增专家只需往这里加一项。
+_DB_DATA_FLAGS = ("has_financial_db_data", "has_tax_db_data", "has_legal_db_data", "has_db_data")
+
+
+def _has_db_data(result: Dict[str, Any]) -> bool:
+    """判断专家结果是否来自企业数据库（兼容各专家不同的字段名）。"""
+    if not isinstance(result, dict):
+        return False
+    for src in (result, result.get("data") if isinstance(result.get("data"), dict) else {}):
+        if not isinstance(src, dict):
+            continue
+        if any(src.get(flag) for flag in _DB_DATA_FLAGS):
+            return True
+    return False
+
+
+# 质量审查 issues 的维度中文名（拼进重做指令时用）
+_ISSUE_DIMENSION_LABEL = {
+    "accuracy": "准确性", "completeness": "完整性", "logic": "逻辑性",
+    "readability": "可读性", "practicality": "实用性", "system": "系统",
+}
+
+
+def _build_retry_query(state: AgentState) -> str:
+    """重做时用的 query：原始问题 + 上一轮的审查意见。
+
+    ⚠️ 为什么需要：反思打回时，专家节点原本只拿到 `state["user_query"]`，
+    既没有 issues 也没有上一版答案 —— 等于【把同一个问题原样再问一遍】。
+    模型不知道错在哪，只能重新掷骰子；若上次低分是因为"太浅/漏项"而非
+    事实错误，重做往往得到同样质量的结果，然后再次不及格，绕满 3 轮到熔断。
+    把审查意见拼进来，重做才真正是"针对性改进"。
+    """
+    base = state.get("user_query", "") or ""
+    if state.get("retry_count", 0) <= 0:
+        return base
+
+    reflection = state.get("reflection_result") or {}
+    issues = reflection.get("issues") or []
+    lines: list[str] = []
+    for it in issues[:5]:
+        if isinstance(it, dict):
+            dim = _ISSUE_DIMENSION_LABEL.get(it.get("dimension", ""), it.get("dimension", ""))
+            desc = (it.get("description") or "").strip()
+            sug = (it.get("suggestion") or "").strip()
+            if not desc and not sug:
+                continue
+            line = f"- {dim}：{desc}" if dim else f"- {desc}"
+            if sug:
+                line += f"（改进建议：{sug}）"
+            lines.append(line)
+        elif it:
+            lines.append(f"- {it}")
+
+    if not lines:
+        return base
+
+    score = reflection.get("score")
+    score_hint = f"（上一版得分 {score:.2f}）" if isinstance(score, (int, float)) else ""
+    return (
+        f"{base}\n\n"
+        f"---\n"
+        f"【重要】你上一版的回答未通过质量审核{score_hint}，请针对下列问题重新作答，"
+        f"不要重复相同的内容：\n" + "\n".join(lines)
+    )
+
 
 class LatencyTracker:
     """延迟追踪器"""
@@ -415,7 +484,7 @@ class Nodes:
 
         try:
             result = await self.orchestrator.finance_specialist.run(
-                user_input=state["user_query"],
+                user_input=_build_retry_query(state),
                 history=history_dicts or None,
                 context=specialist_context,
                 rag_context=rag_ctx
@@ -501,7 +570,7 @@ class Nodes:
         rag_ctx = {"documents": state.get("rag_context", [])} if state.get("rag_context") else None
         try:
             result = await self.orchestrator.tax_specialist.run(
-                user_input=state["user_query"],
+                user_input=_build_retry_query(state),
                 context=specialist_context,
                 rag_context=rag_ctx,
             )
@@ -548,7 +617,7 @@ class Nodes:
         rag_ctx = {"documents": state.get("rag_context", [])} if state.get("rag_context") else None
         try:
             result = await self.orchestrator.legal_specialist.run(
-                user_input=state["user_query"],
+                user_input=_build_retry_query(state),
                 context=specialist_context,
                 rag_context=rag_ctx,
             )
@@ -611,8 +680,8 @@ class Nodes:
         if len(specialist_results) == 1:
             result = specialist_results[0]
             result_confidence = result.get('confidence', 0.0)
-            has_db_data = result.get('has_financial_db_data', False)
-            
+            has_db_data = _has_db_data(result)
+
             if result_confidence >= 0.85 and has_db_data:
                 logger.debug(f"[反思] 快速通过 | confidence={result_confidence:.2f}")
                 return {
@@ -626,9 +695,8 @@ class Nodes:
         data_source_parts = []
         for r in specialist_results:
             source = r.get('source', 'unknown')
-            has_db_data = r.get('has_financial_db_data', False) or r.get('data', {}).get('has_financial_db_data', False)
-            if has_db_data:
-                data = r.get('data', {})
+            if _has_db_data(r):
+                data = r.get('data', {}) if isinstance(r.get('data'), dict) else {}
                 total_revenue = data.get('data_summary', {}).get('total_revenue') or data.get('total_revenue', 'N/A')
                 total_profit = data.get('data_summary', {}).get('total_profit') or data.get('total_profit', 'N/A')
                 data_source_parts.append(
@@ -662,6 +730,10 @@ class Nodes:
                     "score": actual_score,
                     "acceptable": is_acceptable,
                     "issues": quality_result.get("issues", []),
+                    # 已重做次数 —— 随 reflection_result 一起流到前端，
+                    # 让用户看到"系统正在自我纠正"而不是"卡住了"。
+                    "retry_count": new_retry_count,
+                    "max_retries": state.get("max_retries", 3),
                 },
                 "retry_count": new_retry_count
             }
@@ -2236,10 +2308,7 @@ class AgentOrchestrator:
                 )
                 return context
             
-            if intent_result.routing_strategy in [
-                RoutingStrategy.MULTI_SPECIALIST_PARALLEL,
-                RoutingStrategy.MULTI_SPECIALIST_SEQUENTIAL
-            ]:
+            if intent_result.routing_strategy == RoutingStrategy.MULTI_SPECIALIST_PARALLEL:
                 specialist_results = await self._handle_multi_specialist(
                     user_input, intent_result
                 )
@@ -2948,10 +3017,7 @@ class AgentOrchestrator:
                 yield done_event
                 return
             
-            elif intent_result.routing_strategy in [
-                RoutingStrategy.MULTI_SPECIALIST_PARALLEL,
-                RoutingStrategy.MULTI_SPECIALIST_SEQUENTIAL
-            ]:
+            elif intent_result.routing_strategy == RoutingStrategy.MULTI_SPECIALIST_PARALLEL:
                 yield json.dumps({
                     "type": "thinking",
                     "stage": "preparing",

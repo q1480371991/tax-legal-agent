@@ -41,7 +41,6 @@ class RoutingStrategy(str, Enum):
     RAG_RETRIEVAL = "rag_retrieval"
     SINGLE_SPECIALIST = "single_specialist"
     MULTI_SPECIALIST_PARALLEL = "multi_specialist_parallel"
-    MULTI_SPECIALIST_SEQUENTIAL = "multi_specialist_sequential"
     REPORT_QUEUE = "report_queue"
 
 

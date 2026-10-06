@@ -192,14 +192,9 @@ def route_by_intent_result(
                 source=RoutingSource.INTENT_MAP,
                 confidence=confidence,
                 reasoning=f"意图 {intent_value} -> {target_nodes}",
+                # 串行模式已移除（专家间无依赖，并行即可）。这里只区分单/多。
                 execution_mode=(
-                    "parallel"
-                    if routing_strategy
-                    in ("MULTI_SPECIALIST_PARALLEL", "multi_specialial_parallel")
-                    else "sequential"
-                    if routing_strategy
-                    in ("MULTI_SPECIALIST_SEQUENTIAL", "multi_specialist_sequential")
-                    else "single"
+                    "parallel" if str(routing_strategy).lower().endswith("parallel") else "single"
                 ),
             )
     
