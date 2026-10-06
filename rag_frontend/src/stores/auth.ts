@@ -1,4 +1,4 @@
-﻿// Auth Store
+// Auth Store
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { login as apiLogin, register as apiRegister, registerAdmin as apiRegisterAdmin, logout as apiLogout, isAuthenticated, getToken, request } from '@/utils/request'
