@@ -969,33 +969,12 @@ async function stopGeneration() {
 async function sendMessage() {
   if (!userInput.value.trim() || isLoading.value) return
 
-  streamInterrupted.value = false
-  manualStopped.value = false
   let handedOffToPolling = false
   const query = userInput.value.trim()
   userInput.value = ''
   resetChatInput()
 
-  const userMsg: Message = {
-    id: createMessageId(),
-    role: 'user',
-    content: query,
-    timestamp: new Date(),
-  }
-  messages.value.push(userMsg)
-
-  const assistantMsg: Message = {
-    id: createMessageId(),
-    role: 'assistant',
-    content: '',
-    timestamp: new Date(),
-  }
-  messages.value.push(assistantMsg)
-
-  isLoading.value = true
-  resetAgentStages()
-  currentResponse.value = ''
-  scrollToBottom()
+  const assistantMsg = beginTurn(query)
 
   try {
     taskStore.initTask({
@@ -1565,6 +1544,42 @@ function showClarificationDialog(data: any) {
   scrollToBottom()
 }
 
+/**
+ * 发起一轮新查询前的公共准备：追加消息、重置每轮状态、置 loading。
+ *
+ * sendMessage（输入框）与 handleUserClarification（点击澄清选项）都要做同样的事。
+ * 原先两处各写一份，随后逐渐漂移 —— 澄清路径漏了 streamInterrupted / manualStopped
+ * 的重置，导致上一次"手动停止"会污染下一次请求（被误判成用户主动停止，
+ * 从而跳过流式失败后的异步回退），并对每次请求都弹出"流已中断"的告警条。
+ * 统一到这里，避免再出现第三份。
+ */
+function beginTurn(query: string): Message {
+  streamInterrupted.value = false
+  manualStopped.value = false
+  resetAgentStages()
+
+  messages.value.push({
+    id: createMessageId(),
+    role: 'user',
+    content: query,
+    timestamp: new Date(),
+  })
+
+  const assistantMsg: Message = {
+    id: createMessageId(),
+    role: 'assistant',
+    content: '',
+    timestamp: new Date(),
+  }
+  messages.value.push(assistantMsg)
+
+  isLoading.value = true
+  currentResponse.value = ''
+  scrollToBottom()
+
+  return assistantMsg
+}
+
 async function handleUserClarification(text: string) {
   // ⚠️ 不要在这里 delete window.handleClarification*。
   //    澄清卡片是用 v-html 注入的，按钮的 onclick 只能调 window 上的全局函数，
@@ -1573,35 +1588,26 @@ async function handleUserClarification(text: string) {
   //    页面上【所有后续】澄清卡片的按钮都会永久失效——按钮照常显示、点击静默无反应，
   //    且不会有任何报错或网络请求（真实踩过）。
   //    撤销注册改在 onBeforeUnmount 做，那才是唯一正确的时机。
-  
-  const userMsg: Message = {
-    id: createMessageId(),
-    role: 'user',
-    content: text,
-    timestamp: new Date(),
-  }
-  messages.value.push(userMsg)
-  
-  const assistantMsg: Message = {
-    id: createMessageId(),
-    role: 'assistant',
-    content: '',
-    timestamp: new Date(),
-  }
-  messages.value.push(assistantMsg)
-  
-  isLoading.value = true
-  currentStage.value = null
-  currentResponse.value = ''
-  
+
+  const assistantMsg = beginTurn(text)
+
+  let handedOffToPolling = false
   try {
-    await submitAsyncQuery(text, assistantMsg)
+    handedOffToPolling = await submitAsyncQuery(text, assistantMsg)
   } catch (error: any) {
     console.error('追问提交失败:', error)
     const errorMessage = error.message || '未知错误'
     assistantMsg.content = `?**请求失败**\n\n${errorMessage}\n\n💡 请稍后重试`
     taskStore.failTask(errorMessage, currentResponse.value)
-    isLoading.value = false
+  } finally {
+    // ⚠️ 必须放在 finally：原先只在 catch 分支重置 isLoading，
+    //    而成功路径没有兜底 → 后端已返回、答案也已渲染，UI 却永远停在 loading，
+    //    输入框锁死、只能手动点停止（真实踩过，与 sendMessage 的写法保持一致）。
+    //    handedOffToPolling=true 时由轮询逻辑负责收尾，此处不重复处理。
+    if (!handedOffToPolling) {
+      isLoading.value = false
+      saveState()
+    }
     scrollToBottom()
   }
 }
