@@ -29,7 +29,7 @@ import {
   Shield,
   Lightbulb,
   AlertCircle,
-  History
+  History,
   Activity,
 } from 'lucide-vue-next'
 
