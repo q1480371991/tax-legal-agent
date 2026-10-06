@@ -5,6 +5,7 @@ import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { useMultiAgentTaskStore } from '@/stores/multiAgentTask'
 import { useAutoResizeTextarea } from '@/composables/useAutoResizeTextarea'
+import ClarificationCard, { type ClarificationData } from '@/components/ClarificationCard.vue'
 
 import {
   Send,
@@ -102,6 +103,9 @@ interface Message {
   needs_human_review?: boolean
 
   processing_time?: number
+
+  /** 澄清追问：由后端以结构化数据下发，渲染成 <ClarificationCard> */
+  clarification?: ClarificationData
 
 }
 
@@ -735,21 +739,6 @@ onMounted(async () => {
   loadSettings()
   loadChatHistory()
 
-  // 持久注册澄清卡片的全局事件处理器（无论走哪条渲染路径都能响应）
-  window.handleClarificationSelect = (suggestion: string) => {
-    handleUserClarification(suggestion)
-  }
-  window.handleClarificationSubmit = () => {
-    const input = document.getElementById('clarification-input') as HTMLInputElement
-    if (input?.value?.trim()) {
-      handleUserClarification(input.value.trim())
-    }
-  }
-  window.handleClarificationDismiss = () => {
-    currentStage.value = null
-    intentAnalysis.value = null
-  }
-
   const hasAsyncTask = hasPendingAsyncTask()
   const hasRestoredState = loadState()
   
@@ -926,11 +915,6 @@ onBeforeUnmount(() => {
   taskStore.saveTaskState()
   saveState()
   saveSettings()
-
-  // 组件真正卸载时才撤销澄清卡片的全局回调（见 handleUserClarification 的说明）
-  delete window.handleClarificationSelect
-  delete window.handleClarificationSubmit
-  delete window.handleClarificationDismiss
 })
 
 
@@ -1232,6 +1216,12 @@ async function streamQuery(query: string, assistantMsg: Message, token: string |
             currentResponse.value = assistantMsg.content
             receivedText = true
           }
+        } else if (event.type === 'clarification') {
+          // 后端下发的结构化追问 —— 挂到消息上，由 <ClarificationCard> 渲染
+          assistantMsg.clarification = event.clarification
+          currentResponse.value = ''
+          receivedText = true   // 避免 done 的兜底逻辑再灌一遍文本
+          scrollToBottom()
         } else if (event.type === 'chunk') {
           // 流式打字机效果：逐批追加字符
           if (event.agent) activeAgent.value = event.agent
@@ -1516,68 +1506,41 @@ async function resumeTaskFromStorage() {
 
 function showClarificationDialog(data: any) {
   if (!data) return
-  
-  const question = data.question || '请详细描述您的问题'
-  const suggestions = data.suggestions || []
-  const reason = data.reason || ''
-  const required = data.required !== false
-  const placeholder = data.placeholder || ''
-  
+
   isLoading.value = false
-  
+
+  // 与 SSE 路径走同一套：把结构化数据挂到消息上，交给 <ClarificationCard> 渲染。
+  // （原先这里自己拼一份 HTML 字符串 —— 两条路径各拼一份，正是漂移的温床）
   const lastMsgIndex = messages.value.length - 1
   if (lastMsgIndex >= 0 && messages.value[lastMsgIndex].role === 'assistant') {
-    messages.value[lastMsgIndex].content = ''
-  }
-  
-  const clarificationHtml = `
-    <div class="clarification-container">
-      ${reason ? `<div class="reason-badge">💡 ${reason}</div>` : ''}
-      <div class="question-text">${question}</div>
-      ${suggestions.length > 0 ? `
-        <div class="suggestions">
-          ${suggestions.map((s: string) => `
-            <button class="suggestion-btn" onclick="window.handleClarificationSelect('${s.replace(/'/g, "\\'")}')">${s}</button>
-          `).join('')}
-        </div>
-      ` : ''}
-      <div class="custom-input-section">
-        <input 
-          type="text" 
-          id="clarification-input" 
-          class="clarification-input" 
-          placeholder="${placeholder || '或者直接输入您的具体问题...'}"
-          onkeyup="if(event.key==='Enter') window.handleClarificationSubmit()"
-        />
-        <button class="submit-btn" onclick="window.handleClarificationSubmit()">发送</button>
-      </div>
-      ${required ? '' : '<button class="dismiss-btn" onclick="window.handleClarificationDismiss()">稍后再说</button>'}
-    </div>
-  `
-  
-  currentResponse.value = clarificationHtml
-  if (messages.value[lastMsgIndex]) {
-    messages.value[lastMsgIndex].content = clarificationHtml
-  }
-  
-  window.handleClarificationSelect = (suggestion: string) => {
-    handleUserClarification(suggestion)
-  }
-  
-  window.handleClarificationSubmit = () => {
-    const input = document.getElementById('clarification-input') as HTMLInputElement
-    if (input && input.value.trim()) {
-      handleUserClarification(input.value.trim())
+    const msg = messages.value[lastMsgIndex]
+    msg.content = ''
+    msg.clarification = {
+      type: data.type || 'intent_clarification',
+      question: data.question || '请详细描述您的问题',
+      suggestions: data.suggestions || [],
+      reason: data.reason || '',
+      required: data.required !== false,
+      placeholder: data.placeholder || '',
     }
   }
-  
-  window.handleClarificationDismiss = () => {
-    currentStage.value = null
-    intentAnalysis.value = null
-    resetAgentStages()
-  }
-  
+  currentResponse.value = ''
+
   scrollToBottom()
+}
+
+/** 非必答的澄清，用户可跳过 */
+function handleClarificationDismiss() {
+  resetAgentStages()
+}
+
+/**
+ * 某条澄清是否已作答 —— 只要它后面还有消息，就说明用户已经回应过了。
+ * 用来禁用卡片，避免重复提交同一次追问。
+ */
+function isClarificationAnswered(index: number): boolean {
+  if (isLoading.value && index === messages.value.length - 1) return false
+  return index < messages.value.length - 1
 }
 
 /**
@@ -1616,15 +1579,8 @@ function beginTurn(query: string): Message {
   return assistantMsg
 }
 
+/** 用户在澄清卡片上作答（点选建议 或 输入自定义问题） */
 async function handleUserClarification(text: string) {
-  // ⚠️ 不要在这里 delete window.handleClarification*。
-  //    澄清卡片是用 v-html 注入的，按钮的 onclick 只能调 window 上的全局函数，
-  //    而该函数只在 onMounted 注册一次、之后不再注册（showClarificationDialog
-  //    只服务轮询那条路径，SSE 路径不经过它）。若在这里删除，用户点过一次澄清后，
-  //    页面上【所有后续】澄清卡片的按钮都会永久失效——按钮照常显示、点击静默无反应，
-  //    且不会有任何报错或网络请求（真实踩过）。
-  //    撤销注册改在 onBeforeUnmount 做，那才是唯一正确的时机。
-
   const assistantMsg = beginTurn(text)
 
   let handedOffToPolling = false
@@ -1753,10 +1709,7 @@ function getStatusIcon(status: AgentStage['status']) {
 
 function renderMarkdown(content: string): string {
   try {
-    // 澄清卡片是原生 HTML，不需要 Markdown 解析
-    const trimmed = content?.trimStart() || ''
-    const isRawHtml = trimmed.startsWith('<div class="clarification-container">')
-    const html = isRawHtml ? trimmed : (marked.parse(content) as string)
+    const html = marked.parse(content) as string
     if (DOMPurify?.sanitize) {
       return DOMPurify.sanitize(html, {
         ALLOWED_TAGS: [
@@ -1803,12 +1756,11 @@ function agentDisplayName(node: string | null): string {
 }
 
 // 流式中用轻量渲染（仅转义+换行），避免每个 token 都对整段文本重跑 marked/hljs（O(n²) 卡顿）；
-// 流结束后再完整渲染一次。澄清卡片是原生 HTML，需始终走 renderMarkdown。
+// 流结束后再完整渲染一次。
+// 澄清卡片走独立的 <ClarificationCard> 组件，不经过这里，因此无需再做 HTML 特征判断。
 function renderMessageBody(content: string, index: number): string {
   const streaming = isLoading.value && index === messages.value.length - 1
-  const trimmed = content?.trimStart() || ''
-  const isRawHtml = trimmed.startsWith('<div class="clarification-container">')
-  if (streaming && !isRawHtml) {
+  if (streaming) {
     return (content || '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
@@ -2007,10 +1959,21 @@ function renderMessageBody(content: string, index: number): string {
                 <span class="text-xs text-gray-400">{{ formatChatTime(msg.timestamp) }}</span>
               </div>
               <div
-                class="p-3 rounded-xl text-left shadow-sm hover:shadow-md transition-shadow"
-                :class="msg.role === 'user' ? 'bg-blue-50 border border-blue-100' : 'bg-white border border-gray-200'"
+                class="rounded-xl text-left"
+                :class="msg.clarification
+                  ? ''
+                  : ['p-3 shadow-sm hover:shadow-md transition-shadow',
+                     msg.role === 'user' ? 'bg-blue-50 border border-blue-100' : 'bg-white border border-gray-200']"
               >
-                <div v-if="msg.role === 'assistant' && msg.content" class="prose prose-sm max-w-none markdown-content">
+                <!-- 澄清追问：结构化数据 → Vue 组件（不再走 v-html + window 回调） -->
+                <ClarificationCard
+                  v-if="msg.clarification"
+                  :data="msg.clarification"
+                  :disabled="isClarificationAnswered(index)"
+                  @select="handleUserClarification"
+                  @dismiss="handleClarificationDismiss"
+                />
+                <div v-else-if="msg.role === 'assistant' && msg.content" class="prose prose-sm max-w-none markdown-content">
                   <span v-html="renderMessageBody(msg.content, index)"></span>
                   <span
                     v-if="isLoading && index === messages.length - 1"
@@ -2801,123 +2764,5 @@ function renderMessageBody(content: string, index: number): string {
   }
 }
 
-@keyframes clarificationPulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.7; }
-}
-
-.clarification-container {
-  background: linear-gradient(135deg, #2563eb 0%, #0891b2 100%);
-  border-radius: 16px;
-  padding: 24px;
-  color: white;
-  margin: 16px 0;
-  box-shadow: 0 10px 40px rgba(6, 145, 178, 0.3);
-  animation: clarificationPulse 2s ease-in-out infinite;
-}
-
-.clarification-container .reason-badge {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: rgba(255, 255, 255, 0.15);
-  padding: 8px 16px;
-  border-radius: 20px;
-  font-size: 14px;
-  margin-bottom: 16px;
-  width: fit-content;
-}
-
-.clarification-container .question-text {
-  font-size: 18px;
-  font-weight: 600;
-  margin-bottom: 16px;
-  line-height: 1.5;
-}
-
-.clarification-container .suggestions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 20px;
-}
-
-.clarification-container .suggestion-btn {
-  background: rgba(255, 255, 255, 0.2);
-  border: 1px solid rgba(255, 255, 255, 0.4);
-  color: white;
-  padding: 12px 20px;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  font-size: 14px;
-  font-weight: 500;
-}
-
-.clarification-container .suggestion-btn:hover {
-  background: rgba(255, 255, 255, 0.3);
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-}
-
-.clarification-container .custom-input-section {
-  display: flex;
-  gap: 10px;
-  margin-top: 16px;
-}
-
-.clarification-container .clarification-input {
-  flex: 1;
-  padding: 12px 16px;
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-  font-size: 14px;
-  outline: none;
-  transition: all 0.2s ease;
-}
-
-.clarification-container .clarification-input::placeholder {
-  color: rgba(255, 255, 255, 0.6);
-}
-
-.clarification-container .clarification-input:focus {
-  border-color: rgba(255, 255, 255, 0.6);
-  background: rgba(255, 255, 255, 0.15);
-}
-
-.clarification-container .submit-btn {
-  padding: 12px 24px;
-  background: rgba(255, 255, 255, 0.9);
-  color: #0891b2;
-  border: none;
-  border-radius: 8px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.clarification-container .submit-btn:hover {
-  background: white;
-  transform: scale(1.02);
-}
-
-.clarification-container .dismiss-btn {
-  background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.3);
-  color: rgba(255, 255, 255, 0.8);
-  padding: 8px 16px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  transition: all 0.2s ease;
-  margin-top: 12px;
-}
-
-.clarification-container .dismiss-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: white;
-}
 </style>
 

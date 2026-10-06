@@ -687,38 +687,36 @@ class Nodes:
         
         if state.get("needs_clarification") and state.get("clarification_request"):
             clarification = state.get("clarification_request", {})
-            question = clarification.get("question", "") if isinstance(clarification, dict) else str(clarification)
-            suggestions = clarification.get("suggestions", []) if isinstance(clarification, dict) else []
-            reason = clarification.get("reason", "") if isinstance(clarification, dict) else ""
-            placeholder = clarification.get("placeholder", "") if isinstance(clarification, dict) else ""
+            if not isinstance(clarification, dict):
+                clarification = {"question": str(clarification)}
+            question = clarification.get("question", "")
+            suggestions = clarification.get("suggestions") or []
+            reason = clarification.get("reason", "")
             logger.info("[最终答案] 需要追问: %s", question[:80])
 
-            # 构造前端可直接渲染的澄清卡片 HTML，带建议按钮
-            suggestion_btns = ""
-            if suggestions:
-                suggestion_btns = '<div class="suggestions">' + "".join(
-                    f'<button class="suggestion-btn" onclick="window.handleClarificationSelect(\'{s.replace(chr(39), chr(92)+chr(39))}\')">{s}</button>'
-                    for s in suggestions[:4]
-                ) + "</div>"
-
-            clarification_html = f"""<div class="clarification-container">
-{f'<div class="reason-badge">💡 {reason}</div>' if reason else ""}
-<div class="question-text">{question}</div>
-{suggestion_btns}
-<div class="custom-input-section">
-  <input type="text" id="clarification-input" class="clarification-input"
-         placeholder="{placeholder or '或者直接输入您的具体问题...'}"
-         onkeyup="if(event.key==='Enter') window.handleClarificationSubmit()" />
-  <button class="submit-btn" onclick="window.handleClarificationSubmit()">发送</button>
-</div>
-</div>"""
+            # 澄清走【结构化数据】，不再拼 HTML —— 前后端分离：后端只出数据，
+            # 渲染（按钮、事件绑定、样式）全部由前端的 Vue 组件负责。
+            # 旧实现把 HTML 字符串塞进 final_answer，导致：
+            #   · 按钮只能靠 onclick + window 全局函数，绕开 Vue 生命周期（踩过 2 个 bug）
+            #   · 前端要靠 '<div class="clarification-container">' 字符串前缀识别
+            #   · 这段 HTML 会被当作正式答案落库
+            # final_answer 仅保留纯文本兜底（供 SSE 的 done.content 与非 JS 消费方），
+            # 前端识别澄清一律以 clarification_request 为准。
+            clarification_payload = {
+                "type": clarification.get("type", "intent_clarification"),
+                "question": question,
+                "suggestions": list(suggestions)[:4],
+                "reason": reason,
+                "placeholder": clarification.get("placeholder") or "或者直接输入您的具体问题...",
+                "required": clarification.get("required", True),
+            }
 
             return {
                 **state,
-                "final_answer": clarification_html,
-                "output": clarification_html,
-                "needs_clarification": False,
-                "clarification_request": None,
+                "final_answer": question,
+                "output": question,
+                "needs_clarification": True,
+                "clarification_request": clarification_payload,
             }
         
         simple_response = state.get("metadata", {}).get("simple_response")
@@ -753,17 +751,10 @@ class Nodes:
         
         specialist_results = state.get("specialist_results", [])
         logger.debug(f"[最终答案] specialist_results: {len(specialist_results)} 个")
-        
-        if state.get("needs_clarification") and state.get("clarification_request"):
-            logger.info("[最终答案] 需要追问")
-            return {
-                **state,
-                "final_answer": "",
-                "output": "",
-                "needs_clarification": True,
-                "clarification_request": state.get("clarification_request")
-            }
-        
+
+        # 注：澄清分支已在函数开头处理（条件相同，且那里会补齐结构化字段）。
+        # 此处原先还有一段相同的 needs_clarification 判断，永远不可达，已删除。
+
         logger.debug(f"[最终答案] 收到 {len(specialist_results)} 个专家结果")
         
         if not specialist_results:

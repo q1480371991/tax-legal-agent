@@ -298,9 +298,31 @@ async def process_multi_agent_query_stream(
         # 获取工作流结果
         orch_result = None
         _cancelled = False
+        _clarification = None
         try:
             orch_result = workflow_task.result()
-            final_response = orch_result.final_response or "处理完成"
+            # 澄清：把结构化数据下发，前端用 Vue 组件渲染（后端不再拼 HTML）。
+            # 此时 final_response 为空，不能当成"处理完成"，也不能参与 chunk 兜底
+            # —— 否则澄清文本会被逐字推送一遍，前端再叠一张卡片。
+            if getattr(orch_result, "needs_clarification", False) and orch_result.clarification_request:
+                req = orch_result.clarification_request
+                if hasattr(req, "model_dump"):
+                    _clarification = req.model_dump()
+                elif isinstance(req, dict):
+                    _clarification = req
+                else:
+                    _clarification = {k: getattr(req, k, None) for k in
+                                      ("type", "question", "suggestions", "reason", "required", "placeholder")}
+                # 枚举值转成字符串，保证 JSON 可序列化
+                if _clarification.get("type") is not None and hasattr(_clarification["type"], "value"):
+                    _clarification["type"] = _clarification["type"].value
+                final_response = ""
+                logger.info(
+                    f"[SSE] 下发澄清请求 | session={session_id[:8]} "
+                    f"问题={str(_clarification.get('question'))[:40]}"
+                )
+            else:
+                final_response = orch_result.final_response or "处理完成"
         except asyncio.CancelledError:
             # 用户主动停止（/query-cancel）：保留已流式输出的部分，下发 cancelled 标记
             _cancelled = True
@@ -310,11 +332,15 @@ async def process_multi_agent_query_stream(
             logger.error(f"[SSE] 工作流结果获取失败: {e}")
             final_response = f"处理异常: {str(e)[:200]}"
 
+        # 澄清事件：前端据此渲染澄清卡片并挂载交互
+        if _clarification:
+            yield f"data: {json.dumps({'type': 'clarification', 'clarification': _clarification}, ensure_ascii=False)}\n\n"
+
         # 如果专家已通过 chunk_callback 实时推送了 token（真流式），
         # queue 中已有 chunk 事件，此处无需重复发送。
         # 如果专家没有流式能力（降级路径），用后备的 chunk 分发保证用户看到内容。
         # 判断方法：检查 queue 是否已消费过 chunk 事件（用标志位）
-        if not _cancelled and not getattr(orch, "_streamed_chunks_count", 0):
+        if not _cancelled and not _clarification and not getattr(orch, "_streamed_chunks_count", 0):
             # 后备：分批推送完整文本
             CHUNK_SIZE = 4
             for i in range(0, len(final_response), CHUNK_SIZE):
@@ -335,6 +361,8 @@ async def process_multi_agent_query_stream(
             "processing_time": elapsed,
             "cancelled": _cancelled,
         }
+        if _clarification:
+            done_event["needs_clarification"] = True
         yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
 
         # 后台持久化到专用多智能体会话表（不阻塞 SSE 流）
@@ -350,19 +378,27 @@ async def process_multi_agent_query_stream(
                 routing_val = routing_val.value
             complexity_val = getattr(ir, "complexity", None)
             specialists_val = list(getattr(ir, "required_specialists", []) or [])
-        asyncio.create_task(_save_ma_session_bg(
-            session_id=session_id,
-            tenant_id=tenant_context['tenant_id'],
-            user_id=str(current_user.id),
-            user_query=request.query,
-            final_response=final_response,
-            intent=intent_val,
-            routing_strategy=routing_val,
-            complexity=complexity_val,
-            specialists=specialists_val,
-            processing_time=elapsed,
-            enable_reflection=enable_reflection,
-        ))
+
+        # 澄清轮次不作为一条"对话"落库：
+        #   · 它不是答案（final_response 为空，存进去历史里会是一条空记录）
+        #   · 用户点选后会产生新的 session_id，那一轮才是真正的问答
+        # 旧实现把澄清的 HTML 当成 final_response 存了下来（历史里能看到一段 HTML）。
+        if _clarification:
+            logger.info(f"[MA保存] 跳过澄清轮次 | session={session_id[:8]}")
+        else:
+            asyncio.create_task(_save_ma_session_bg(
+                session_id=session_id,
+                tenant_id=tenant_context['tenant_id'],
+                user_id=str(current_user.id),
+                user_query=request.query,
+                final_response=final_response,
+                intent=intent_val,
+                routing_strategy=routing_val,
+                complexity=complexity_val,
+                specialists=specialists_val,
+                processing_time=elapsed,
+                enable_reflection=enable_reflection,
+            ))
 
     return StreamingResponse(
         event_stream(),
@@ -503,6 +539,23 @@ async def process_multi_agent_query(
                 revision_required=result.reflection_result.revision_required
             )
         
+        # 澄清：作为结构化数据随响应下发，由前端 Vue 组件渲染（后端不再拼 HTML）
+        _resp_metadata = dict(result.metadata or {})
+        _needs_clarification = bool(getattr(result, "needs_clarification", False) and result.clarification_request)
+        if _needs_clarification:
+            _req = result.clarification_request
+            if hasattr(_req, "model_dump"):
+                _clar = _req.model_dump()
+            elif isinstance(_req, dict):
+                _clar = dict(_req)
+            else:
+                _clar = {k: getattr(_req, k, None) for k in
+                         ("type", "question", "suggestions", "reason", "required", "placeholder")}
+            if _clar.get("type") is not None and hasattr(_clar["type"], "value"):
+                _clar["type"] = _clar["type"].value
+            _resp_metadata["needs_clarification"] = True
+            _resp_metadata["clarification_request"] = _clar
+
         response = MultiAgentResponse(
             session_id=session_id,
             request_id=request_id,
@@ -514,7 +567,7 @@ async def process_multi_agent_query(
             needs_human_review=result.needs_human_review,
             confidence=result.confidence,
             processing_time=processing_time,
-            metadata=result.metadata or {}
+            metadata=_resp_metadata
         )
         
         logger.info(f"查询处理完成 - 请求ID: {request_id}, 耗时: {processing_time:.2f}秒")
