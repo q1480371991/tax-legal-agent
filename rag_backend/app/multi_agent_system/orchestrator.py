@@ -1727,47 +1727,25 @@ class AgentOrchestrator:
         "legal": "legal_specialist",
     }
 
-    @staticmethod
-    def _classify_failure_type(review_result: Dict[str, Any]) -> str:
-        """根据质量审查的 issues 文本，粗分失败类型，便于针对性重做。"""
-        issues = review_result.get("issues", []) or []
-        texts: List[str] = []
-        for it in issues:
-            if isinstance(it, dict):
-                texts.append(str(it.get("description", "")))
-            else:
-                texts.append(str(it))
-        blob = " ".join(texts)
-
-        if any(k in blob for k in ["笼统", "缺少", "不够详细", "过于简单", "不具体", "流程", "泛泛", "空洞", "浅"]):
-            return "shallow_answer"
-        if any(k in blob for k in ["错误", "不准确", "有误", "事实", "前后矛盾"]):
-            return "factual_error"
-        if any(k in blob for k in ["不完整", "遗漏", "缺失", "未覆盖", "没有回答"]):
-            return "incomplete"
-        if any(k in blob for k in ["跑题", "无关", "答非所问", "偏离"]):
-            return "off_topic"
-        return "quality_issue"
-
     def _build_repair_plan(
         self,
-        review_result: Dict[str, Any],
-        user_input: str,
         specialist_results: List[Dict[str, Any]],
         fallback_target: str = "finance_specialist",
     ) -> Dict[str, Any]:
         """
-        构建反思打回（repair）计划：决定把不合格的回答打回给**实际运行过的领域专家**，
-        并标注失败类型。修复了旧逻辑无论什么领域都打回 finance 的错配问题。
+        决定把不合格的回答打回给**实际运行过的领域专家**。
+        修复了旧逻辑无论什么领域都打回 finance 的错配问题。
+
+        注：这里原本还返回 failure_type / score，并接收 review_result / user_input，
+        但它们从未被调用方使用（failure_type 只进了一行 debug 日志），已一并移除。
+        真正驱动"针对性重做"的是 issues 文本，已由 _build_retry_query 注入专家输入。
 
         Args:
-            review_result: 质量审查结果（含 scores / issues / is_quality_acceptable）
-            user_input: 用户原始查询
             specialist_results: 已运行专家的结果列表（每项含 specialist_type 或 source）
             fallback_target: 无法识别专家时的兜底目标节点
 
         Returns:
-            {"target": str|List[str], "targets": List[str], "failure_type": str, "score": float}
+            {"target": str|List[str], "targets": List[str]}
         """
         targets: List[str] = []
         for r in (specialist_results or []):
@@ -1785,14 +1763,9 @@ class AgentOrchestrator:
         if not targets:
             targets = [fallback_target or "finance_specialist"]
 
-        scores = review_result.get("scores", {}) if isinstance(review_result, dict) else {}
-        score = scores.get("overall", review_result.get("score", 0.0))
-
         return {
             "target": targets[0] if len(targets) == 1 else targets,
             "targets": targets,
-            "failure_type": self._classify_failure_type(review_result),
-            "score": score,
         }
 
     async def _execute_langgraph_workflow(
@@ -1909,13 +1882,11 @@ class AgentOrchestrator:
             specialists = state.get("specialists_needed", [])
             fallback = self._SPECIALIST_NODE_MAP.get(specialists[0], "finance_specialist") if specialists else "finance_specialist"
             plan = self._build_repair_plan(
-                review_result=state.get("reflection_result", {}) or {},
-                user_input=state.get("user_query", ""),
                 specialist_results=state.get("specialist_results", []),
                 fallback_target=fallback,
             )
             targets = plan.get("targets") or [plan.get("target", fallback)]
-            logger.debug("[反思路由] 打回重做 (第 %s 次): %s (failure=%s)", retries + 1, targets, plan.get("failure_type"))
+            logger.debug("[反思路由] 打回重做 (第 %s 次): %s", retries + 1, targets)
             return targets if len(targets) > 1 else targets[0]
 
         workflow.add_conditional_edges(
