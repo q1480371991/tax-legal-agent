@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿<script setup lang="ts">
+<script setup lang="ts">
 
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 
@@ -42,6 +42,10 @@ import DOMPurify from 'dompurify'
 import hljs from 'highlight.js'
 
 import { formatChatTime } from '@/utils/time'
+import {
+  intentLabel, intentHint, routingLabel, routingHint, complexityLabel, specialistLabel,
+  normalizeReflection, type ReflectionInfo,
+} from '@/utils/multiAgentLabels'
 
 
 
@@ -161,7 +165,7 @@ const enableRAG = ref(true)
 
 const currentStage = ref<string | null>(null)
 
-const intentAnalysis = ref<{ category: string; confidence: number; strategy: string } | null>(null)
+const intentAnalysis = ref<{ category: string; confidence: number; strategy: string; specialists?: string[] } | null>(null)
 
 const activeSpecialists = ref<string[]>([])
 
@@ -179,7 +183,7 @@ function toggleFlowPanel() {
   localStorage.setItem(FLOW_PANEL_KEY, showFlowPanel.value ? '1' : '0')
 }
 
-const reflectionResult = ref<string | null>(null)
+const reflectionResult = ref<ReflectionInfo | null>(null)
 const processingTime = ref<number | null>(null)
 const ttftMs = ref<number | null>(null)
 const latencySummary = ref<any>(null)
@@ -568,7 +572,7 @@ function loadState() {
 
       activeSpecialists.value = state.activeSpecialists || []
 
-      reflectionResult.value = state.reflectionResult
+      reflectionResult.value = normalizeReflection(state.reflectionResult)
 
       processingTime.value = state.processingTime
 
@@ -762,7 +766,7 @@ onMounted(async () => {
     currentStage.value = savedTask.currentStage
     intentAnalysis.value = savedTask.intentAnalysis
     activeSpecialists.value = savedTask.activeSpecialists
-    reflectionResult.value = savedTask.reflectionResult
+    reflectionResult.value = normalizeReflection(savedTask.reflectionResult)
     processingTime.value = savedTask.processingTime
     currentResponse.value = savedTask.currentResponse
     enableReflection.value = savedTask.enableReflection
@@ -904,9 +908,20 @@ onMounted(async () => {
 
 let stateSaveInterval: number | null = null
 
+// 悬浮窗（BackgroundTaskIndicator）在对话页点"查看详情"时派发此事件 ——
+// 统一入口后它无法再靠路由跳转"查看"，改为就地展开右侧流程面板。
+function onOpenFlowPanel() {
+  showFlowPanel.value = true
+  flowPanelManuallyToggled.value = true
+  localStorage.setItem(FLOW_PANEL_KEY, '1')
+}
 
+onMounted(() => {
+  window.addEventListener('multi-agent:open-flow-panel', onOpenFlowPanel)
+})
 
 onBeforeUnmount(() => {
+  window.removeEventListener('multi-agent:open-flow-panel', onOpenFlowPanel)
   stopStreaming()
   stopPolling()
   if (stateSaveInterval) {
@@ -1189,15 +1204,16 @@ async function streamQuery(query: string, assistantMsg: Message, token: string |
               category: event.intent.category || '分析中',
               confidence: event.intent.confidence || 0.5,
               strategy: event.intent.routing_strategy || 'multi_agent',
+              specialists: event.intent.specialists || event.specialists || [],
             }
           }
           if (event.specialists) {
             activeSpecialists.value = event.specialists
           }
           if (event.result) {
-            reflectionResult.value = Array.isArray(event.result)
-              ? event.result.join('\n')
-              : String(event.result)
+            // 后端下发的是对象 {score, acceptable, issues}，直接 String() 会变成
+            // "[object Object]" —— 早先页面上显示的正是这个。规整后再交给面板渲染。
+            reflectionResult.value = normalizeReflection(event.result)
           }
         } else if (event.type === 'thinking') {
           progressEvents.value.push(event)
@@ -1437,7 +1453,9 @@ function updateProgressDisplay(status: any) {
       intentAnalysis.value = {
         category: status.intent_analysis.category || '分析中',
         confidence: status.intent_analysis.confidence || 0.5,
-        strategy: status.intent_analysis.routing_strategy || 'multi_agent'
+        strategy: status.intent_analysis.routing_strategy || 'multi_agent',
+        // 与 SSE 路径保持同一形状（避免两条路径再次漂移）
+        specialists: status.intent_analysis.specialists || status.specialists || []
       }
     }
     
@@ -1602,6 +1620,35 @@ async function handleUserClarification(text: string) {
     }
     scrollToBottom()
   }
+}
+
+/** 反思审核结论 —— 说清"发生了什么"，而不是丢一个分数给用户 */
+function reflectionVerdict(r: ReflectionInfo): string {
+  if (r.skipped) return '审查未完成，已直接放行'
+  if (r.acceptable === false) return '未达标，已自动重做'
+  if (r.acceptable === true) return '质量达标，直接采用'
+  return '已完成审核'
+}
+
+/** 各维度问题维度的中文名 */
+const REFLECTION_DIMENSION_LABEL: Record<string, string> = {
+  accuracy: '准确性',
+  completeness: '完整性',
+  logic: '逻辑性',
+  readability: '可读性',
+  practicality: '实用性',
+  system: '系统',
+}
+
+/** issues 既可能是结构化对象，也可能是字符串 —— 统一取一句可读说明 */
+function reflectionIssueText(issue: unknown): string {
+  if (!issue) return ''
+  if (typeof issue === 'string') return issue
+  if (typeof issue !== 'object') return String(issue)
+  const o = issue as { dimension?: string; description?: string }
+  const dim = o.dimension ? (REFLECTION_DIMENSION_LABEL[o.dimension] || o.dimension) : ''
+  const desc = o.description || ''
+  return dim && desc ? `${dim}：${desc}` : (desc || dim)
 }
 
 function resetAgentStages() {
@@ -2218,11 +2265,17 @@ function renderMessageBody(content: string, index: number): string {
               <div v-if="getStageStatus(stage.id) === 'completed'" class="mt-1 animate-fadeIn space-y-1">
                 <div v-if="stage.id === 'intent' && intentAnalysis" class="p-1 bg-gradient-to-br from-blue-50 to-blue-100 rounded border border-blue-200">
                   <div class="flex items-center justify-between mb-0.5">
-                    <span class="text-xs font-medium text-blue-700">{{ intentAnalysis.category }}</span>
+                    <span class="text-xs font-medium text-blue-700">{{ intentLabel(intentAnalysis.category) }}</span>
                     <span class="text-xs font-bold text-blue-900">{{ (intentAnalysis.confidence * 100).toFixed(0) }}%</span>
                   </div>
+                  <p v-if="intentHint(intentAnalysis.category)" class="text-xs text-blue-600 mb-0.5 leading-tight">
+                    {{ intentHint(intentAnalysis.category) }}
+                  </p>
+                  <p class="text-xs text-blue-600 mb-0.5 leading-tight">
+                    处理方式：{{ routingLabel(intentAnalysis.strategy) }}
+                  </p>
                   <div class="w-full bg-blue-200 rounded-full h-0.5">
-                    <div 
+                    <div
                       class="bg-blue-600 h-0.5 rounded-full"
                       :style="{ width: `${intentAnalysis.confidence * 100}%` }"
                     ></div>
@@ -2237,14 +2290,27 @@ function renderMessageBody(content: string, index: number): string {
                       :key="specialist"
                       class="px-1 py-0.5 bg-cyan-200 text-cyan-800 rounded text-xs"
                     >
-                      {{ specialist }}
+                      {{ specialistLabel(specialist) }}
                     </span>
                   </div>
                 </div>
 
-                <div v-if="stage.id === 'reflection' && reflectionResult" class="p-1 bg-gradient-to-br from-green-50 to-green-100 rounded border border-green-200">
-                  <span class="text-xs font-medium text-green-700 block mb-0.5">审核结果</span>
-                  <p class="text-xs text-green-900 line-clamp-2">{{ reflectionResult }}</p>
+                <div v-if="stage.id === 'reflection' && reflectionResult" class="p-1.5 bg-gradient-to-br from-green-50 to-green-100 rounded border border-green-200">
+                  <div class="flex items-center justify-between mb-0.5">
+                    <span class="text-xs font-medium text-green-700">审核结果</span>
+                    <span
+                      v-if="reflectionResult.score !== undefined"
+                      class="text-xs font-bold"
+                      :class="reflectionResult.acceptable ? 'text-green-800' : 'text-amber-700'"
+                    >{{ (reflectionResult.score * 100).toFixed(0) }} 分</span>
+                  </div>
+                  <p class="text-xs mb-0.5"
+                     :class="reflectionResult.acceptable ? 'text-green-800' : 'text-amber-700'">
+                    {{ reflectionVerdict(reflectionResult) }}
+                  </p>
+                  <p v-if="reflectionResult.issues?.length" class="text-xs text-green-700 leading-tight">
+                    {{ reflectionIssueText(reflectionResult.issues[0]) }}
+                  </p>
                 </div>
               </div>
             </div>
@@ -2287,21 +2353,31 @@ function renderMessageBody(content: string, index: number): string {
             <span class="text-xs text-cyan-700 font-medium">专业Agent</span>
           </div>
           <p class="text-sm font-bold text-cyan-900">{{ activeSpecialists.length }} 个</p>
-          <p class="text-xs text-cyan-700 mt-0.5">{{ activeSpecialists.join('、') }}</p>
+          <p class="text-xs text-cyan-700 mt-0.5">{{ activeSpecialists.map(specialistLabel).join('、') }}</p>
         </div>
-        
+
         <div v-if="intentAnalysis" class="bg-gradient-to-br from-green-50 to-green-100 p-1.5 rounded">
           <div class="flex items-center gap-1 mb-0.5">
             <TrendingUp :size="10" class="text-green-600" />
             <span class="text-xs text-green-700 font-medium">意图识别</span>
           </div>
-          <p class="text-xs font-semibold text-green-900 mb-0.5">{{ intentAnalysis.category }}</p>
+          <p class="text-xs font-semibold text-green-900 mb-0.5">{{ intentLabel(intentAnalysis.category) }}</p>
+          <p v-if="intentHint(intentAnalysis.category)" class="text-xs text-green-700 leading-tight mb-1">
+            {{ intentHint(intentAnalysis.category) }}
+          </p>
+          <div class="flex items-center justify-between">
+            <span class="text-xs text-green-700">处理方式</span>
+            <span class="text-xs font-medium text-green-900">{{ routingLabel(intentAnalysis.strategy) }}</span>
+          </div>
+          <p v-if="routingHint(intentAnalysis.strategy)" class="text-xs text-green-600 leading-tight mb-1">
+            {{ routingHint(intentAnalysis.strategy) }}
+          </p>
           <div class="flex items-center justify-between">
             <span class="text-xs text-green-700">置信度</span>
             <span class="text-sm font-bold text-green-900">{{ (intentAnalysis.confidence * 100).toFixed(0) }}%</span>
           </div>
           <div class="w-full bg-green-200 rounded-full h-0.5 mt-1">
-            <div 
+            <div
               class="bg-green-600 h-0.5 rounded-full transition-all"
               :style="{ width: `${intentAnalysis.confidence * 100}%` }"
             ></div>
@@ -2348,11 +2424,30 @@ function renderMessageBody(content: string, index: number): string {
         </div>
         
         <div v-if="reflectionResult" class="bg-gradient-to-br from-pink-50 to-pink-100 p-1.5 rounded">
-          <div class="flex items-center gap-1 mb-0.5">
-            <Shield :size="10" class="text-pink-600" />
-            <span class="text-xs text-pink-700 font-medium">反思审核</span>
+          <div class="flex items-center justify-between mb-0.5">
+            <div class="flex items-center gap-1">
+              <Shield :size="10" class="text-pink-600" />
+              <span class="text-xs text-pink-700 font-medium">反思审核</span>
+            </div>
+            <span
+              v-if="reflectionResult.score !== undefined"
+              class="text-xs font-bold"
+              :class="reflectionResult.acceptable ? 'text-pink-900' : 'text-amber-700'"
+            >{{ (reflectionResult.score * 100).toFixed(0) }} 分</span>
           </div>
-          <p class="text-xs text-pink-900 line-clamp-2">{{ reflectionResult }}</p>
+          <p class="text-xs font-medium"
+             :class="reflectionResult.acceptable === false ? 'text-amber-700' : 'text-pink-900'">
+            {{ reflectionVerdict(reflectionResult) }}
+          </p>
+          <p v-if="reflectionResult.issues?.length" class="text-xs text-pink-700 leading-tight mt-0.5">
+            {{ reflectionIssueText(reflectionResult.issues[0]) }}
+            <span v-if="reflectionResult.issues.length > 1" class="text-pink-500">
+              等 {{ reflectionResult.issues.length }} 项
+            </span>
+          </p>
+          <p class="text-[10px] text-pink-500 leading-tight mt-0.5">
+            由独立质量审查打分（准确性/完整性等 5 项），低于阈值自动打回重做
+          </p>
         </div>
         
         <div v-if="sessionId" class="bg-gradient-to-br from-gray-50 to-gray-100 p-1.5 rounded border border-gray-200">

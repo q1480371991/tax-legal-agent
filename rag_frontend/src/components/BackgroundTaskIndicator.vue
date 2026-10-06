@@ -17,7 +17,9 @@ const isCompleted = computed(() =>
   taskStore.activeTask.currentStage === 'response'
 )
 
-const isMultiAgentPage = computed(() => route.name === 'multi-agent-chat')
+// 统一入口后，聊天页的路由名是 'chat'（旧的 'multi-agent-chat' 已随页面合并移除）。
+// 这里判断"是否已在对话页"——已在对话页时不显示悬浮窗（右侧流程面板已经在展示进度）。
+const isChatPage = computed(() => route.name === 'chat')
 
 const stageLabels: Record<string, string> = {
   receptionist: '接收输入',
@@ -72,8 +74,13 @@ const taskProgress = computed(() => {
 })
 
 function goToMultiAgent() {
-  // 统一入口：任务进度页即主对话页（原 /multi-agent 已合并到 /）
-  router.push('/')
+  // 已在对话页时 router.push('/') 是空操作 —— 这正是"点查看详情没反应"的原因。
+  // 改为：不在对话页就跳过去；已在对话页就把右侧流程面板展开（真正"看详情"）。
+  if (route.name !== 'chat') {
+    router.push('/')
+    return
+  }
+  window.dispatchEvent(new CustomEvent('multi-agent:open-flow-panel'))
 }
 
 function dismissTask() {
@@ -84,7 +91,7 @@ function dismissTask() {
 <template>
   <Transition name="slide-up">
     <div 
-      v-if="hasTask && !isMultiAgentPage"
+      v-if="hasTask && !isChatPage"
       class="fixed bottom-4 right-4 z-50 max-w-sm bg-white rounded-xl shadow-2xl border border-gray-200 overflow-hidden"
     >
       <div 
