@@ -128,7 +128,10 @@ _CROSS_DOMAIN_CUES = (
     "涉及", "涵盖", "结合", "分别从", "从.*角度", "多个方面", "各方面",
     "综合", "全面", "以及",
     # 并列/递进连接词 —— 表示"多个领域都要处理"
-    "和", "与", "、", "并", "同时", "既", "又",
+    # 注：中英文逗号也在此列。中文里用逗号罗列多个诉求极常见
+    #     （「有税务风险，合同有没有问题，财务健不健康」），
+    #     原先只收了顿号「、」，导致这类请求被误判为单领域。
+    "和", "与", "、", "，", ",", "并", "同时", "既", "又",
 )
 # "对比/区别"类 —— 会命中领域词但只需单专家
 _CONTRAST_CUES = ("区别", "差异", "不同", "比较", "对比", "哪个更", "谁更")
@@ -969,7 +972,18 @@ class IntentRouterAgent(BaseAgent):
             routing_strategy,
             text=user_input,
         )
-        
+
+        # 路由策略必须与实际专家数一致 —— 否则前端面板会自相矛盾
+        # （实测出现过「路由=单专家 但 专家=[finance, tax]」：
+        #   _determine_required_specialists 内部的跨领域检测把专家改成了多个，
+        #   而 routing_strategy 早在它之前就算好了，两者不再对齐）。
+        if len(specialists or []) > 1 and routing_strategy != RoutingStrategy.MULTI_SPECIALIST_PARALLEL:
+            logger.info(
+                "[IntentRouter] 专家数(%d)与路由策略(%s)不一致，修正为多专家并行",
+                len(specialists), routing_strategy,
+            )
+            routing_strategy = RoutingStrategy.MULTI_SPECIALIST_PARALLEL
+
         needs_review = self._should_require_human_review(
             intent_result_dict["confidence"],
             complexity,

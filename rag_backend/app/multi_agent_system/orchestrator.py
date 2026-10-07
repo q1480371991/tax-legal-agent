@@ -685,7 +685,14 @@ class Nodes:
             if result_confidence >= 0.85 and has_db_data:
                 logger.debug(f"[反思] 快速通过 | confidence={result_confidence:.2f}")
                 return {
-                    "reflection_result": {"score": result_confidence, "acceptable": True},
+                    "reflection_result": {
+                        "score": result_confidence,
+                        "acceptable": True,
+                        "fast_path": True,
+                        # 与前端的展示契约保持一致（否则面板上一会有"重做 0 次"、一会没有）
+                        "retry_count": current_retry,
+                        "max_retries": state.get("max_retries", 3),
+                    },
                     "retry_count": current_retry
                 }
         
