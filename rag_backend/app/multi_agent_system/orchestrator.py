@@ -122,6 +122,32 @@ def _build_retry_query(state: AgentState) -> str:
     )
 
 
+# 专家标识 → 展示名。
+# 原先这个映射在 3 处各写了一份，且不一致（两处写「法律专家」、一处写「法务专家」）。
+# 统一到这里，新增专家只改一处。
+_SPECIALIST_DISPLAY = {
+    "finance": "💰 财务专家",
+    "tax": "📋 税务专家",
+    "legal": "⚖️ 法律专家",
+}
+# 不带 emoji 的版本 —— 给 LLM 看的地方用（如质量审查的专家标题），
+# 避免 emoji 影响模型判断，也避免内部枚举名 finance/tax/legal
+# 经审查 LLM 转述后漏进用户可见的审查意见里。
+_SPECIALIST_DISPLAY_PLAIN = {
+    "finance": "财务专家",
+    "tax": "税务专家",
+    "legal": "法律专家",
+}
+
+
+def _specialist_display(source: Optional[str], *, plain: bool = False) -> str:
+    """把内部专家标识（finance/tax/legal）转成展示名，未知值原样返回。"""
+    table = _SPECIALIST_DISPLAY_PLAIN if plain else _SPECIALIST_DISPLAY
+    if not source:
+        return "专家"
+    return table.get(source, source)
+
+
 class LatencyTracker:
     """延迟追踪器"""
     
@@ -696,7 +722,13 @@ class Nodes:
                     "retry_count": current_retry
                 }
         
-        response_text = "\n\n".join([f"### {r.get('source')}\n{r.get('content', '')}" for r in specialist_results])
+        # 用中文专家名而非内部标识（finance/tax/legal）：
+        #   审查 LLM 会转述这些标题，内部枚举名会就此漏进用户可见的审查意见里
+        #   （实测出现过"finance和legal两个模块的回答较为简略"这样的话）。
+        response_text = "\n\n".join(
+            f"### {_specialist_display(r.get('source'), plain=True)}\n{r.get('content', '')}"
+            for r in specialist_results
+        )
         logger.info(f"[反思] 合并 {len(specialist_results)} 个专家结果")
         
         data_source_parts = []
@@ -707,7 +739,7 @@ class Nodes:
                 total_revenue = data.get('data_summary', {}).get('total_revenue') or data.get('total_revenue', 'N/A')
                 total_profit = data.get('data_summary', {}).get('total_profit') or data.get('total_profit', 'N/A')
                 data_source_parts.append(
-                    f"- {source}专家：来自企业数据库（营业收入: {total_revenue}元，利润: {total_profit}元）"
+                    f"- {_specialist_display(source, plain=True)}：来自企业数据库（营业收入: {total_revenue}元，利润: {total_profit}元）"
                 )
         
         data_source_info = "\n".join(data_source_parts) if data_source_parts else "无数据来源信息"
@@ -1073,10 +1105,9 @@ class Nodes:
     def _fallback_concat(self, specialist_results: list) -> str:
         """降级方案：灾难发生时的基础拼接"""
         parts = ["## 📊 综合分析报告 (系统降级版)\n\n"]
-        source_names = {"finance": "💰 财务专家", "tax": "📋 税务专家", "legal": "⚖️ 法律专家"}
         for result in specialist_results:
             source = result.get("source", "unknown")
-            name = source_names.get(source, f"🤖 {source}专家")
+            name = _specialist_display(source)
             content = result.get("content", "")
             parts.append(f"### {name}\n\n{content}\n\n---\n\n")
         return "".join(parts)
@@ -2917,8 +2948,7 @@ class AgentOrchestrator:
             
             if intent_result.routing_strategy == RoutingStrategy.SINGLE_SPECIALIST:
                 specialist_type = intent_result.requires_specialists[0] if intent_result.requires_specialists else "finance"
-                specialist_name_map = {"finance": "💰 财务专家", "tax": "📋 税务专家", "legal": "⚖️ 法务专家"}
-                specialist_display = specialist_name_map.get(specialist_type, specialist_type)
+                specialist_display = _specialist_display(specialist_type)
                 
                 latency_tracker.mark("specialist_start")
                 
@@ -4236,9 +4266,8 @@ class AgentOrchestrator:
 
         error_msg = specialist_result.get("error", "处理失败")
         specialist_display = specialist_result.get("specialist", "专家")
-        specialist_name_map = {"finance": "💰 财务专家", "tax": "📋 税务专家", "legal": "⚖️ 法务专家"}
-        
-        return f"""## {specialist_name_map.get(specialist_display, specialist_display)}
+
+        return f"""## {_specialist_display(specialist_display)}
 
 ### ❌ 处理失败
 
