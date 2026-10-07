@@ -686,7 +686,14 @@ class FinanceSpecialist(BaseSpecialistAgent):
         return FinancialDomain.OTHER
 
     # =========================================================================
-    # 🆕 财务数据查询守卫
+    # ⚠️ 以下是【已废弃、无生产调用点】的旧守卫，保留仅供测试参考，勿在新代码中使用。
+    #    它们用关键词表猜"要不要查数据库"，而实际机制是：
+    #    _register_mcp_tools() 无条件注册财务数据工具，由【专家的 LLM 通过
+    #    tool-calling 自行决定】是否调用 —— 后者更准（能看懂"销售额500万"
+    #    意味着要查数据，而词表只看到"公司"两个字）。
+    #    同类已废弃方法还有：
+    #      _is_financial_query / _response_has_tool_call / _response_has_financial_intent
+    #      （本文件）以及 tax_specialist._should_query_enterprise_data。
     # =========================================================================
 
     @staticmethod

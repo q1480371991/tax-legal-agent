@@ -20,7 +20,6 @@ from .state import (
     BlackboardEvent
 )
 
-from .agent_router import AgentRouter, RouteDecision, RouteMode, RoutingRule
 from .coordinator import AgentCoordinator
 from .orchestrator import AgentOrchestrator, OrchestrationContext
 
@@ -60,10 +59,10 @@ __all__ = [
     "BlackboardEvent",
     
     # 核心组件
-    "AgentRouter",
-    "RouteDecision",
-    "RouteMode",
-    "RoutingRule",
+    # 注：原 AgentRouter / RouteDecision / RouteMode / RoutingRule 已移除 ——
+    #     它所在的 agent_router.py 从未被实例化，是"黑板规则路由"那套的遗留；
+    #     实际路由由 intent_router_agent + routing/unified_router 承担。
+    #     （另注意 app/services/smart_router.py 里有一个同名的 RouteMode，与本处无关）
     "AgentCoordinator",
     "AgentOrchestrator",
     "OrchestrationContext",
