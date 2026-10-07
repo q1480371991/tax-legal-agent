@@ -208,12 +208,28 @@ class Nodes:
 
     @staticmethod
     def _is_meta_question(query: str) -> bool:
-        """检测是否是元问题（技能询问、配置查询、自我介绍等），不需要 RAG/图谱检索/反思"""
+        """检测是否是元问题（在问助手自身的能力/配置），不需要 RAG/图谱检索/反思。
+
+        ⚠️ 判据必须是"在问助手自身"，不能是"出现了某个词"。
+        曾经只用单字匹配 ["技能","能力",...]，把「分析一下我们公司的偿债**能力**」
+        误判成元问题 → 跳过质量审核（该问题本来会走 finance_specialist → reflection）。
+        这与「报告中…是多少」曾被「报告」单字误判为"要生成报告"是同一类错误：
+        中文里这些词既可以是【问助手】，也可以是【业务名词】。
+
+        现在的判据：先要有"助手自身"的指向，再叠加能力类词。
+        """
         q = query.lower()
+
+        # 指向助手自身 —— 没有这个，就只是在谈业务
+        self_refs = ("你", "您", "助手", "机器人", "系统", "ai", "你自己", "这个平台")
+        if not any(r in q for r in self_refs):
+            return False
+
+        # 在问助手的能力/配置/身份
         meta_patterns = [
-            "技能", "能力", "会做什么", "擅长", "功能介绍", "工具",
-            "skill", "capability",
-            "你是什么", "你是谁", "你能做什么",
+            "技能", "能力", "会做什么", "会什么", "擅长", "功能介绍", "工具",
+            "skill", "capability", "能做什么", "可以做什么", "支持什么",
+            "你是谁", "你是什么", "你叫", "自我介绍",
         ]
         return any(p in q for p in meta_patterns)
 
@@ -318,8 +334,10 @@ class Nodes:
             return updated_state
         
         inner_result = intent_result.intent_result
-        specialists_needed = inner_result.requires_specialists[:3] if inner_result.requires_specialists else ["finance"]
-        logger.info(f"[意图路由] 意图: {inner_result.intent.value} | 需要专家: {specialists_needed}")
+        # 不再用 ["finance"] 兜底：那会让"没有专家"（纯检索/闲聊）被误标成财务专家，
+        # 前端面板会显示"财务专家"而实际没派。空数组 = 没有专家，是唯一契约。
+        specialists_needed = list(inner_result.requires_specialists or [])[:3]
+        logger.info(f"[意图路由] 意图: {inner_result.intent.value} | 需要专家: {specialists_needed or '无'}")
         
         updated_state = {
             **state,
@@ -1715,10 +1733,16 @@ class AgentOrchestrator:
         if intent == "direct_answer" or routing_strategy == "direct_answer":
             logger.debug("[Router Edge] 直接回答，路由到 final")
             return "final"
-            
-        elif intent == "rag_only" or routing_strategy == "rag_retrieval":
-            # RAG 已在 rag_retrieval 节点前置完成，直接去 final 由其基于 rag_context 生成答案
-            logger.debug("[Router Edge] RAG 已前置，路由到 final")
+
+        elif (intent == "rag_only" or routing_strategy == "rag_retrieval") and not specialists:
+            # RAG 已在 rag_retrieval 节点前置完成，直接去 final 由其基于 rag_context 生成答案。
+            # ⚠️ 仅当【没有专家】时才这么走：routing_strategy 为 rag_retrieval 但
+            #    specialists 非空，说明意图路由认为这是需要专家处理的问题（只是答案
+            #    同时可以从知识库补充）。若这里直接跳 final，会退化成
+            #    _generate_rag_answer 的通用作答，把本该专家处理的问题降级
+            #    —— 实测「个人所得税的税率是多少」就这样被降级，而知识库里并没有税法。
+            #    有专家时落到下面按专家数分流。
+            logger.debug("[Router Edge] RAG 已前置且无专家，路由到 final")
             return "final"
 
         # 多专家判断优先：compliance_check、multi_specialist 意图或 specialists > 1

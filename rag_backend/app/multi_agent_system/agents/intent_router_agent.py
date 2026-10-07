@@ -543,12 +543,37 @@ class IntentRouterAgent(BaseAgent):
         else:
             return ComplexityLevel.VERY_HIGH
     
+    def _resolve_routing_strategy(
+        self,
+        llm_routing,
+        intent: IntentCategory,
+        complexity: ComplexityLevel,
+    ) -> RoutingStrategy:
+        """决定路由策略。★ LLM 判断优先，规则仅降级。
+
+        为什么把 routing_strategy 也交给 LLM：它要区分的是"查事实 vs 做分析"，
+        而这与领域无关 —— 「比亚迪的开发支出是多少」（查，走 RAG）和
+        「分析一下我们公司的偿债能力」（析，派专家）都是 finance。
+        用 intent 标签去推这件事推不准（LLM 会把后者也标成 knowledge_query），
+        用专家列表也推不准（两者都有 finance）。既然分类调用本来就在跑，
+        就直接问它，规则只在 LLM 不可用时兜底。
+        """
+        if isinstance(llm_routing, str):
+            try:
+                return RoutingStrategy(llm_routing.strip().lower())
+            except ValueError:
+                logger.warning("[IntentRouter] LLM 返回未知路由 %r，降级到规则", llm_routing)
+        elif isinstance(llm_routing, RoutingStrategy):
+            return llm_routing
+
+        return self._determine_routing_strategy(intent, complexity)
+
     def _determine_routing_strategy(
         self,
         intent: IntentCategory,
         complexity: ComplexityLevel
     ) -> RoutingStrategy:
-        """决定路由策略"""
+        """【降级路径】按意图+复杂度决定路由策略（LLM 不可用时才走这里）。"""
         if intent in [IntentCategory.GREETING, IntentCategory.CHIT_CHAT]:
             return RoutingStrategy.DIRECT_ANSWER
         
@@ -569,17 +594,78 @@ class IntentRouterAgent(BaseAgent):
         
         return RoutingStrategy.SINGLE_SPECIALIST
     
+    # LLM 可能返回中文或带后缀的写法，统一归一化到内部标识
+    _SPECIALIST_ALIASES = {
+        "finance": "finance", "financial": "finance", "财务": "finance",
+        "财务会计": "finance", "finance_specialist": "finance",
+        "tax": "tax", "税务": "tax", "tax_specialist": "tax",
+        "legal": "legal", "law": "legal", "法律": "legal", "法务": "legal",
+        "legal_specialist": "legal",
+    }
+
+    @classmethod
+    def _normalize_specialists(cls, raw) -> Optional[List[str]]:
+        """把 LLM 给的专家列表归一化；无法解析时返回 None（表示"没拿到有效判断"）。"""
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return None
+        out: List[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            key = cls._SPECIALIST_ALIASES.get(item.strip().lower())
+            if key and key not in out:
+                out.append(key)
+        return out
+
     def _determine_required_specialists(
         self,
         intent: IntentCategory,
         routing_strategy: RoutingStrategy,
         text: str = "",
+        llm_specialists: Optional[List[str]] = None,
     ) -> List[str]:
-        """确定需要的专家。
+        """确定需要哪些专家。
 
-        text 用于检测【显式跨领域请求】（如"涉及财务和法务"）——
-        这类查询即使被 LLM 判成单一领域意图，也应按跨领域派多个专家。
+        ★ 判断权在 LLM，规则只做降级。
+
+        判断"这段话涉及几个领域"是【语义理解】而非字符串匹配。曾经用
+        _CROSS_DOMAIN_CUES 词表做这件事，实测反复失败：
+          「…税务风险，合同有没有问题，财务健不健康」→ 逗号不在词表，漏判
+          「…有税务隐患？顺便合同会不会有法律问题」 → "顺便"不在词表，漏判
+          「分析一下我们公司的偿债能力」           → "偿债"不在领域词表，漏判
+        每漏一次补一个词，永远补不完，且失败是静默的（只是少派专家，不报错）。
+        改为直接问 LLM（分类调用本来就在跑，加字段零额外延迟），规则仅兜底。
+
+        Args:
+            intent: 意图
+            routing_strategy: 路由策略
+            text: 用户原始输入（降级路径与校验用）
+            llm_specialists: LLM 给出的专家列表（None=未提供，走降级）
         """
+        # ── 1. LLM 判断优先 ──
+        if llm_specialists is not None:
+            normalized = self._normalize_specialists(llm_specialists)
+            if normalized is not None:
+                # 校验：LLM 说单专家、而文本命中 3 个领域词时记一条 warning。
+                # 只用于【观察 LLM 判断是否退化】，不用它改写路由 ——
+                # 词表判错过太多次，不能反过来否决 LLM。
+                if len(normalized) == 1 and text:
+                    hits = [d for d, words in _DOMAIN_WORDS.items()
+                            if any(w in text.lower() for w in words)]
+                    if len(hits) >= 3:
+                        logger.warning(
+                            "[IntentRouter] 路由存疑：LLM 判单专家(%s)，但文本命中 %d 个领域词 %s | %s",
+                            normalized[0], len(hits), hits, text[:50],
+                        )
+                logger.info("[IntentRouter] 专家由 LLM 判定: %s", normalized)
+                return normalized
+
+        # ── 2. 降级：LLM 不可用时的规则兜底 ──
+        logger.info("[IntentRouter] 专家判定降级到规则（LLM 未提供判断）")
         intent_specialist_map = {
             IntentCategory.FINANCIAL_ANALYSIS: ["finance"],
             IntentCategory.ACCOUNTING_QUERY: ["finance"],
@@ -595,7 +681,7 @@ class IntentRouterAgent(BaseAgent):
             IntentCategory.COMPLIANCE_CHECK: ["finance", "tax", "legal"],
             IntentCategory.IP_PROTECTION: ["legal"],
         }
-        
+
         specialists = intent_specialist_map.get(intent, [])
 
         # 显式跨领域请求（"涉及财务和法务"）优先于单领域意图判定 ——
@@ -615,7 +701,13 @@ class IntentRouterAgent(BaseAgent):
         #     SINGLE_SPECIALIST（有 specialists）或 MULTI_SPECIALIST_PARALLEL
         #     （其对应的 COMPLEX_TASK/MULTI_SPECIALIST 已被覆盖）。已删除。
 
-        return specialists if specialists else ["general"]
+        # 找不到对应专家时返回【空列表】，表示"没有专家"。不要用 ["general"] 当哨兵：
+        # 它非空，会让 `if specialists:` 之类的判断误以为有专家，
+        # 进而把纯知识检索也放行到专家分支（orchestrator 里已有一处 == ["general"] 的
+        # 补丁，就是为了绕开这个哨兵）。
+        if specialists:
+            return specialists
+        return []
     
     def _should_require_human_review(
         self,
@@ -768,6 +860,9 @@ class IntentRouterAgent(BaseAgent):
 {{
   "intent": "意图类别",
   "sub_intent": "子意图（可选）",
+  "requires_specialists": ["finance"],
+  "routing_strategy": "rag_retrieval",
+  "confidence": 0.85,
   "params": {{"建议参数"}},
   "reasoning": "推理过程",
   "needs_clarification": false,
@@ -778,8 +873,108 @@ class IntentRouterAgent(BaseAgent):
 注意：
 1. 如果是问候语，返回 intent: "greeting"
 2. 如果是闲聊，返回 intent: "chit_chat"
-3. 如果需要多个专家，返回 intent: "multi_specialist"
-4. 如果用户要求生成报告，设置 needs_report_generation: true
+3. 如果用户要求生成报告，设置 needs_report_generation: true
+
+★ 关于 intent 的"查询 vs 分析"（重要，容易混）：
+   **查询**：问一个【已有的事实/数值】，答案能从文档或数据里"找出来"。
+       多为 "是多少 / 是什么 / 有哪些 / 在哪里"
+       → knowledge_query, document_search
+      例：「比亚迪2026年第一季度报告中的开发支出是多少」→ knowledge_query
+          「万科2025年年报的营业收入是多少」       → knowledge_query
+          「大湖股份和业绩补偿方是什么关系」       → knowledge_query
+
+   **分析**：要求【判断、评估、比较、给建议】，答案必须"做出来"而不只是"找出来"。
+       多为 "分析 / 评估 / 怎么样 / 有没有问题 / 该如何 / 给我建议"
+       → financial_analysis, risk_analysis, tax_* , contract_review, legal_consultation …
+      例：「分析一下我们公司的偿债能力」   → financial_analysis（不是 knowledge_query）
+          「我们公司的资产负债率是多少」   → financial_analysis（需要取数计算，不是查文档）
+          「帮我看看合同里有什么法律风险」 → contract_review
+
+   判别口诀：**"找答案" 还是 "做判断"**。前者 knowledge_query，后者归到对应领域。
+
+★ 关于 requires_specialists（重要）：
+   判断这个问题需要哪几位领域专家来回答。
+   可选值只有三个："finance"（财务）、"tax"（税务）、"legal"（法律）。
+
+   判据：**用户是否提出了分属不同领域的多个诉求**。
+   连接方式无关紧要 —— 逗号、顿号、"和"、"顺便"、"另外"都一样，
+   看的是【诉求的领域归属】而不是【出现了什么连接词】。
+
+   ✅ 需要多专家（用户提了多个领域的诉求）：
+      「我们公司有什么税务风险，合同有没有问题，财务健不健康」
+        → ["finance", "tax", "legal"]   三个诉求分属三个领域
+      「账面利润不错，但是不是有税务隐患？顺便合同条款会不会有法律问题」
+        → ["tax", "legal"]              "顺便"引出的是另一个领域
+      「结合财务数据和最新税收政策给出建议」
+        → ["finance", "tax"]
+
+   ❌ 只需单专家（即使出现了多个领域词）：
+      「财务和法务的区别是什么」
+        → ["finance"]  这是【对比/解释】题，是对两个概念做比较，
+                        不是"既要财务分析又要法务分析"
+      「税务筹划和税务合规有什么不同」
+        → ["tax"]      同上，对比题
+      「分析一下我们公司的偿债能力」
+        → ["finance"]  只有一个诉求
+
+   ⚠️ 判断口诀：
+      问的是"它们之间有什么不同/关系" → 对比题，单专家
+      问的是"帮我把这几件事都办了"   → 多专家
+
+4. 无法归入任何领域（如纯粹的常识问答、知识库事实查询）→ 返回空数组 []
+
+★ 关于 routing_strategy（重要）：
+   决定这条问题【由谁作答】，取值只能是下列之一：
+     "direct_answer"  —— 问候/闲聊，不检索不派专家
+     "rag_retrieval"  —— 从知识库【找事实】作答，不派专家
+     "single_specialist"         —— 交给【一位】领域专家
+     "multi_specialist_parallel" —— 交给【多位】专家（与 requires_specialists 对应）
+     "report_queue"   —— 用户要求生成报告
+
+   ⚠️ 最容易搞混的是 rag_retrieval 与 single_specialist ——
+      **两者可以是同一个领域**。真正的判别不是"问得多简单"，
+      而是【答案在哪】：
+
+      · 答案能在【企业知识库的文档】里读到
+        （年报里的数字、公告里的关系、合同里的条款原文）
+        → rag_retrieval
+
+        「比亚迪2026年第一季度报告中的开发支出是多少」
+          → rag_retrieval + ["finance"]    数字写在年报里，检索即可
+        「万科2025年年报的营业收入是多少」
+          → rag_retrieval + ["finance"]    同上
+        「大湖股份和业绩补偿方是什么关系」
+          → rag_retrieval + []             关系写在公告里
+
+      · 需要【专业判断/计算】，或答案属于该领域的【通用专业知识】
+        （法规条文、税率表、折旧方法、合同风险要点 —— 这些不在企业文档里，
+          而在专家的知识里）
+        → single_specialist
+
+        「个人所得税的税率是多少」
+          → single_specialist + ["tax"]
+            税率表是法定知识，不在企业年报里；税务专家能直接给出完整税率表
+        「分析一下我们公司的偿债能力」
+          → single_specialist + ["finance"]   要评估判断，还要取企业数据计算
+        「财务和法务的区别是什么」
+          → single_specialist + ["finance"]   概念解释，靠专业知识
+        「帮我看看合同里有什么法律风险」
+          → single_specialist + ["legal"]     要专业审查判断
+
+   ⚠️ 判断口诀：
+      **答案能在企业文档里"读到" → rag_retrieval；
+        要靠"专业判断/通用专业知识" → 派专家。**
+      注意「是多少」并不意味着一定走 RAG —— 若该事实企业文档里没有，
+      而属于通用专业知识（如税率、法规），仍应派专家。
+
+   注意 requires_specialists 与 routing_strategy 要自洽：
+     · rag_retrieval 时 specialists 表示"这条内容属于哪个领域"（可给可空），
+       但**不会真的调用专家**，最终由知识库检索直接作答
+     · single/multi_specialist 时 specialists 必须非空，且多专家时用 multi_*
+
+★ 关于 confidence：
+   你对这个判断的把握，0.0~1.0。字段明确、单一领域且无歧义时给 0.85 以上；
+   需要推断、边界模糊时给低一些。不要一律给 0.5 —— 低于阈值的会被规则层覆盖。
 
 ★ 关于 needs_clarification（重要）：
    判断"这个问题是否【信息不足到无法作答】，必须先问用户"。
@@ -888,16 +1083,20 @@ class IntentRouterAgent(BaseAgent):
             
             if should_use_rule:
                 # 只替换【意图/置信度】等规则更可信的字段，
-                # 但保留 LLM 的【澄清判断】—— 它是对"是否信息不足"的语义判断，
-                # 规则层给不出（原实现整个 result = rule_result，把 clarification
-                # 字段一起丢了，导致 LLM 判出的"需澄清"失效）。
-                _clar = {
+                # 但保留 LLM 的【澄清判断】与【专家判断】—— 它们都是语义判断，
+                # 规则层给不出（原实现整个 result = rule_result，把这些一起丢了）：
+                #   · clarification_*：LLM 判出的"需澄清"会失效
+                #   · requires_specialists：LLM 判出的"需要哪几位专家"会失效，
+                #     退回硬编码的意图→专家表，跨领域请求被降级成单专家
+                _preserve = {
                     "needs_clarification": result.get("needs_clarification"),
                     "clarification_question": result.get("clarification_question"),
                     "clarification_options": result.get("clarification_options"),
+                    "requires_specialists": result.get("requires_specialists"),
+                    "routing_strategy": result.get("routing_strategy"),
                 }
                 result = rule_result
-                for _k, _v in _clar.items():
+                for _k, _v in _preserve.items():
                     if _v not in (None, ""):
                         result[_k] = _v
             
@@ -962,25 +1161,34 @@ class IntentRouterAgent(BaseAgent):
             entities
         )
         
-        routing_strategy = self._determine_routing_strategy(
+        routing_strategy = self._resolve_routing_strategy(
+            intent_result_dict.get("routing_strategy"),
             intent_result_dict["intent"],
-            complexity
+            complexity,
         )
-        
+
         specialists = self._determine_required_specialists(
             intent_result_dict["intent"],
             routing_strategy,
             text=user_input,
+            llm_specialists=intent_result_dict.get("requires_specialists"),
         )
 
-        # 路由策略必须与实际专家数一致 —— 否则前端面板会自相矛盾
-        # （实测出现过「路由=单专家 但 专家=[finance, tax]」：
-        #   _determine_required_specialists 内部的跨领域检测把专家改成了多个，
-        #   而 routing_strategy 早在它之前就算好了，两者不再对齐）。
-        if len(specialists or []) > 1 and routing_strategy != RoutingStrategy.MULTI_SPECIALIST_PARALLEL:
+        # ── 最后校验：路由与专家自洽 ──
+        # 正常情况 LLM 已给出自洽的一组（判别口诀见 prompt）。
+        # ⚠️ 这里【不要】因为"有专家"就把 rag_retrieval 升格成单专家 ——
+        #    rag_retrieval 时 specialists 只是"这条内容属于哪个领域"的标注
+        #    （「比亚迪开发支出是多少」→ rag + ["finance"]），并不会真的调用专家。
+        #    曾经加过这条升格规则，反而把 LLM 的正确判断改坏了。
+        # 只兜两类真正的不一致：
+        if routing_strategy in (RoutingStrategy.SINGLE_SPECIALIST,
+                                RoutingStrategy.MULTI_SPECIALIST_PARALLEL) and not specialists:
+            logger.info("[IntentRouter] 路由=%s 但无专家，退为知识库检索", routing_strategy)
+            routing_strategy = RoutingStrategy.RAG_RETRIEVAL
+        elif len(specialists) > 1 and routing_strategy == RoutingStrategy.SINGLE_SPECIALIST:
             logger.info(
-                "[IntentRouter] 专家数(%d)与路由策略(%s)不一致，修正为多专家并行",
-                len(specialists), routing_strategy,
+                "[IntentRouter] 专家数(%d)与路由=单专家不一致，修正为多专家并行",
+                len(specialists),
             )
             routing_strategy = RoutingStrategy.MULTI_SPECIALIST_PARALLEL
 

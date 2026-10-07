@@ -549,9 +549,17 @@ class TaxSpecialist(BaseSpecialistAgent):
             处理结果
         """
         try:
-            # 🆕 注册表守卫：当用户问技能/能力且该领域无注册技能时，直接返回，不调 LLM
-            _meta_kw = ["技能", "能力", "会做什么", "擅长", "功能介绍"]
-            if any(kw in user_input.lower() for kw in _meta_kw):
+            # 🆕 注册表守卫：当用户【在问助手自身的能力】且该领域无注册技能时，
+            # 直接返回，不调 LLM。
+            # ⚠️ 判据必须含"指向助手自身"，不能只看出现某能力词 ——
+            # 否则「我们公司的偿债能力怎么样」会被误判成"在问技能"，
+            # 直接回一句"当前暂无可用技能"，白白丢掉一个正常业务问题。
+            # （与 orchestrator._is_meta_question 同一类问题，判据保持一致）
+            _q = user_input.lower()
+            _self_ref = any(r in _q for r in ("你", "您", "助手", "机器人", "系统", "ai"))
+            _meta_kw = ["技能", "能力", "会做什么", "会什么", "擅长", "功能介绍",
+                        "能做什么", "可以做什么", "支持什么"]
+            if _self_ref and any(kw in _q for kw in _meta_kw):
                 # 只查领域专有技能（不包含 public 公共技能）
                 has_domain_skills = False
                 if self.skill_registry and self.skill_registry.is_initialized():
