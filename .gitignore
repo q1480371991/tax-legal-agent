@@ -64,6 +64,17 @@ rag_backend/FRONTEND_IMPROVEMENTS.md
 # ========================
 # 开发文档（包含大量内部开发记录，不需要上传）
 docs/
+# 公开部署文档；其他内部开发记录继续忽略
+!/docs/
+/docs/*
+!/docs/DEPLOYMENT.md
+# README 公开图稿，仅允许图片文件
+!/docs/assets/
+/docs/assets/*
+!/docs/assets/figures/
+/docs/assets/figures/*
+!/docs/assets/figures/*.png
+!/docs/assets/figures/*.svg
 test_templates/
 # ========================
 # 备份和测试输出文件
